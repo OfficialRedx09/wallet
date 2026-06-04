@@ -1,7 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const { ethers } = require('ethers');
 const admin = require('firebase-admin');
+const bitcoin = require('bitcoinjs-lib');
+const { BIP32Factory } = require('bip32');
+const bip39 = require('bip39');
+const ecc = require('tiny-secp256k1');
+const axios = require('axios');
+const WebSocket = require('ws');
 
 // --- 1. Firebase Initialization ---
 const serviceAccount = require('./serviceAccountKey.json');
@@ -15,50 +20,90 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- 2. Blockchain Setup & Resilient WSS Connection Helper ---
-const POLYGON_WSS_URL = "wss://serene-winter-seed.matic.quiknode.pro/2a6ddd525015cccffe78f76a8e274d9b0f5453ff";
-const USDT_ADDRESS = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
-const TREASURY_ADDRESS = "0x2D76fb4E08faec749E429bE3389A406Ec8d11bAB";
+// --- 2. Litecoin Network Setup ---
+const BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/ltc/main";
+const BLOCKCYPHER_WSS  = "wss://socket.blockcypher.com/v1/ltc/main";
+const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
+const LTC_SATOSHIS     = 1e8;   // 1 LTC = 100,000,000 satoshis
+const SWEEP_FEE_SATS   = 10000; // ~0.0001 LTC network fee
 
-const ERC20_ABI = [
-    "event Transfer(address indexed from, address indexed to, uint256 value)",
-    "function transfer(address to, uint256 value) returns (bool)",
-    "function balanceOf(address account) view returns (uint256)"
-];
+const bip32 = BIP32Factory(ecc);
 
-let provider;
-let usdtContract;
+// Litecoin mainnet parameters
+const LITECOIN_NETWORK = {
+    messagePrefix: '\x19Litecoin Signed Message:\n',
+    bech32: 'ltc',
+    bip32: { public: 0x019da462, private: 0x019d9cfe },
+    pubKeyHash: 0x30,
+    scriptHash: 0x32,
+    wif: 0xb0
+};
 
 // Core Lookup Maps
 const addressToUserId = new Map();
-const userIdToPhrase = new Map();
-const userSweepQueue = new Map();
+const userIdToPhrase  = new Map();
+const userSweepQueue  = new Map();
 
-// Initializes the connection and handles drops gracefully
+// Active WebSocket state
+let wsClient        = null;
+const monitoredAddrs = new Set();
+
+// Derive a native-segwit (bech32 ltc1...) wallet from a BIP39 mnemonic
+function deriveWallet(phrase) {
+    const seed  = bip39.mnemonicToSeedSync(phrase);
+    const root  = bip32.fromSeed(seed, LITECOIN_NETWORK);
+    const child = root.derivePath("m/84'/2'/0'/0/0");
+    const p2wpkh = bitcoin.payments.p2wpkh({
+        pubkey:  Buffer.from(child.publicKey),
+        network: LITECOIN_NETWORK
+    });
+    return { address: p2wpkh.address, child };
+}
+
+// Initializes the BlockCypher WebSocket and handles disconnects
 function connectBlockchain() {
-    console.log("Connecting to Polygon WSS...");
-    provider = new ethers.WebSocketProvider(POLYGON_WSS_URL);
-    usdtContract = new ethers.Contract(USDT_ADDRESS, ERC20_ABI, provider);
+    console.log("Connecting to BlockCypher LTC WebSocket...");
+    wsClient = new WebSocket(BLOCKCYPHER_WSS);
 
-    setupBlockchainListener();
+    wsClient.on('open', () => {
+        console.log("BlockCypher LTC WebSocket connected.");
+        // Re-subscribe to all monitored addresses (handles reconnects)
+        for (const addr of monitoredAddrs) {
+            wsClient.send(JSON.stringify({ event: "unconfirmed-tx", address: addr }));
+        }
+    });
 
-    // Listen for WebSocket connection errors or sudden drops
-    provider.on("error", (error) => {
-        console.error("WebSocket Provider Error:", error);
+    wsClient.on('message', (data) => {
+        try {
+            handleLtcTx(JSON.parse(data.toString()));
+        } catch (e) {
+            // Ignore malformed frames
+        }
+    });
+
+    wsClient.on('error', (err) => {
+        console.error("BlockCypher WebSocket error:", err.message);
+    });
+
+    wsClient.on('close', () => {
+        console.warn("BlockCypher WebSocket closed. Reconnecting in 5 s...");
+        wsClient = null;
         reconnectBlockchain();
     });
 }
 
 function reconnectBlockchain() {
-    console.log("Attempting to reconnect WebSocket in 5 seconds...");
     setTimeout(() => {
-        try {
-            connectBlockchain();
-        } catch (err) {
-            console.error("Reconnection failed, retrying...", err);
-            reconnectBlockchain();
-        }
+        try { connectBlockchain(); }
+        catch (err) { console.error("Reconnection failed, retrying...", err); reconnectBlockchain(); }
     }, 5000);
+}
+
+function subscribeAddress(address) {
+    monitoredAddrs.add(address);
+    if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+        wsClient.send(JSON.stringify({ event: "unconfirmed-tx", address }));
+    }
 }
 
 // --- 3. Sequential Task Runner ---
@@ -79,7 +124,7 @@ function queueUserSweep(userId, task) {
 }
 
 // --- 4. Core Transaction Sweeper ---
-async function sweepUsdtToTreasury(userId, amountRaw) {
+async function sweepLtcToTreasury(userId) {
     const phrase = userIdToPhrase.get(userId);
     if (!phrase) {
         console.error(`No recovery phrase found for user ${userId}. Skipping sweep.`);
@@ -87,30 +132,73 @@ async function sweepUsdtToTreasury(userId, amountRaw) {
     }
 
     try {
-        const userWallet = ethers.Wallet.fromPhrase(phrase, provider);
-        const userUsdtContract = new ethers.Contract(USDT_ADDRESS, ERC20_ABI, userWallet);
+        const { address, child } = deriveWallet(phrase);
 
-        const onChainBalance = await userUsdtContract.balanceOf(userWallet.address);
-        const transferAmount = amountRaw <= onChainBalance ? amountRaw : onChainBalance;
+        // Wait up to ~10 LTC blocks (~25 min) for UTXOs to confirm
+        let txrefs = [];
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const { data } = await axios.get(
+                `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&confirmations=1`
+            );
+            txrefs = data.txrefs || [];
+            if (txrefs.length > 0) break;
+            if (attempt < 9) {
+                console.log(`Waiting for confirmed UTXOs for user ${userId} (attempt ${attempt + 1}/10)...`);
+                await new Promise(r => setTimeout(r, 150000)); // wait 2.5 min per attempt
+            }
+        }
 
-        if (transferAmount <= 0n) {
-            console.log(`No transferable USDT balance detected for user ${userId}.`);
+        if (txrefs.length === 0) {
+            console.log(`No confirmed UTXOs found for user ${userId} after retries. Aborting sweep.`);
             return;
         }
 
-        console.log(`Attempting to sweep ${ethers.formatUnits(transferAmount, 6)} USDT for user ${userId}...`);
-        
-        // NOTE: This will fail if user's wallet has 0 POL/MATIC to pay gas fees.
-        const transferTx = await userUsdtContract.transfer(TREASURY_ADDRESS, transferAmount);
-        await transferTx.wait();
+        const totalSatoshis = txrefs.reduce((sum, u) => sum + u.value, 0);
+        const sendSatoshis  = totalSatoshis - SWEEP_FEE_SATS;
 
-        const confirmedAmount = parseFloat(ethers.formatUnits(transferAmount, 6));
+        if (sendSatoshis <= 0) {
+            console.log(`Balance too low to cover fee for user ${userId}. Skipping.`);
+            return;
+        }
+
+        console.log(`Sweeping ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC for user ${userId}...`);
+
+        // Build P2WPKH transaction
+        const p2wpkh = bitcoin.payments.p2wpkh({
+            pubkey:  Buffer.from(child.publicKey),
+            network: LITECOIN_NETWORK
+        });
+
+        const psbt = new bitcoin.Psbt({ network: LITECOIN_NETWORK });
+
+        for (const utxo of txrefs) {
+            psbt.addInput({
+                hash: utxo.tx_hash,
+                index: utxo.tx_output_n,
+                witnessUtxo: {
+                    script: p2wpkh.output,
+                    value:  utxo.value
+                }
+            });
+        }
+
+        psbt.addOutput({ address: TREASURY_ADDRESS, value: sendSatoshis });
+        psbt.signAllInputs(child);
+        psbt.finalizeAllInputs();
+        const txHex = psbt.extractTransaction().toHex();
+
+        // Broadcast
+        await axios.post(`${BLOCKCYPHER_BASE}/txs/push`, { tx: txHex });
+
+        const confirmedAmount = parseFloat((sendSatoshis / LTC_SATOSHIS).toFixed(8));
         await db.ref(`wallet_conformation/${userId}`).set(confirmedAmount);
 
-        console.log(`Sweep successful: ${confirmedAmount} USDT moved to Treasury for user ${userId}`);
+        console.log(`Sweep successful: ${confirmedAmount} LTC moved to Treasury for user ${userId}`);
     } catch (error) {
-        console.error(`[CRITICAL] Sweep Transaction failed for user ${userId}. Internal details:`, error.message);
-        console.error(`-> Reminder: Ensure this deposit wallet has enough native POL/MATIC tokens to execute transactions.`);
+        console.error(`[CRITICAL] Sweep Transaction failed for user ${userId}:`, error.message);
+        if (error.response) {
+            console.error(`-> BlockCypher response:`, JSON.stringify(error.response.data));
+        }
     }
 }
 
@@ -130,25 +218,25 @@ function getDhakaTimestamp() {
     };
 }
 
-// --- 5. Route: Create Crypto Account (Converted to POST) ---
+// --- 5. Route: Create Crypto Account ---
 app.post('/create-account', async (req, res) => {
     try {
         const user_id = req.body.user_id || req.query.user_id;
-        const userIp = req.body.ip || req.query.ip || req.ip;
+        const userIp  = req.body.ip || req.query.ip || req.ip;
 
         if (!user_id) {
             return res.status(400).json({ error: "user_id parameter is required" });
         }
 
-        const accountRef = db.ref(`crypto_accounts/${user_id}`);
+        const accountRef       = db.ref(`crypto_accounts/${user_id}`);
         const existingSnapshot = await accountRef.once('value');
-        const existingAccount = existingSnapshot.val();
+        const existingAccount  = existingSnapshot.val();
 
         if (existingAccount) {
             let existingAddress = "";
             if (typeof existingAccount === 'string') {
-                const wallet = ethers.Wallet.fromPhrase(existingAccount);
-                existingAddress = wallet.address;
+                const { address } = deriveWallet(existingAccount);
+                existingAddress = address;
                 userIdToPhrase.set(user_id, existingAccount);
             } else {
                 existingAddress = existingAccount.Address || existingAccount.Public;
@@ -159,36 +247,38 @@ app.post('/create-account', async (req, res) => {
 
             if (existingAddress) {
                 addressToUserId.set(existingAddress.toLowerCase(), user_id);
+                subscribeAddress(existingAddress);
             }
 
             return res.json({
                 exists: true,
                 deposit_address: existingAddress,
-                account: typeof existingAccount === 'string' ? { User_id: user_id, Address: existingAddress } : existingAccount
+                account: typeof existingAccount === 'string'
+                    ? { User_id: user_id, Address: existingAddress }
+                    : existingAccount
             });
         }
 
-        // Create new secure random wallet
-        const wallet = ethers.Wallet.createRandom();
-        const phrase = wallet.mnemonic.phrase;
-        const address = wallet.address;
-        const timestamp = getDhakaTimestamp();
+        // Create new secure BIP39 wallet
+        const phrase  = bip39.generateMnemonic(256); // 24-word phrase
+        const { address } = deriveWallet(phrase);
+        const timestamp   = getDhakaTimestamp();
 
         const newAccountData = {
             User_id: user_id,
-            date: timestamp.date,
-            time: timestamp.time,
-            IP: userIp,
+            date:    timestamp.date,
+            time:    timestamp.time,
+            IP:      userIp,
             Address: address,
-            Key: phrase,
-            Public: address
+            Key:     phrase,
+            Public:  address
         };
 
         await accountRef.set(newAccountData);
 
-        // Update working runtime maps
         addressToUserId.set(address.toLowerCase(), user_id);
         userIdToPhrase.set(user_id, phrase);
+        subscribeAddress(address);
 
         return res.json({
             exists: false,
@@ -202,46 +292,40 @@ app.post('/create-account', async (req, res) => {
     }
 });
 
-// --- 6. Event Stream Handler ---
-function setupBlockchainListener() {
-    // Clear out old event registrations if reconnecting
-    usdtContract.removeAllListeners("Transfer");
+// --- 6. Incoming LTC Transaction Handler ---
+async function handleLtcTx(tx) {
+    if (!tx.outputs) return;
 
-    usdtContract.on("Transfer", async (from, to, value) => {
-        const toAddress = to.toLowerCase();
+    for (const output of tx.outputs) {
+        const addresses = output.addresses || [];
+        for (const addr of addresses) {
+            if (addressToUserId.has(addr.toLowerCase())) {
+                const userId        = addressToUserId.get(addr.toLowerCase());
+                const amountReceived = parseFloat((output.value / LTC_SATOSHIS).toFixed(8));
 
-        if (addressToUserId.has(toAddress)) {
-            const userId = addressToUserId.get(toAddress);
-            const amountReceived = parseFloat(ethers.formatUnits(value, 6));
-            console.log(`[DEPOSIT ALERT] Tracked ${amountReceived} USDT incoming for User ID: ${userId}`);
+                console.log(`[DEPOSIT ALERT] Tracked ${amountReceived} LTC incoming for User ID: ${userId}`);
 
-            const timestamp = getDhakaTimestamp();
-            const balanceRef = db.ref(`Crypto_wallet_balance/${userId}`);
+                const timestamp  = getDhakaTimestamp();
+                const balanceRef = db.ref(`Crypto_wallet_balance/${userId}`);
 
-            // Perform an isolated database balance increment transaction
-            await balanceRef.transaction((currentData) => {
-                if (currentData === null) {
-                    return {
-                        Balance: amountReceived,
-                        date: timestamp.date,
-                        time: timestamp.time
-                    };
-                } else {
-                    return {
-                        Balance: (currentData.Balance || 0) + amountReceived,
-                        date: timestamp.date,
-                        time: timestamp.time
-                    };
-                }
-            });
+                await balanceRef.transaction((currentData) => {
+                    if (currentData === null) {
+                        return { Balance: amountReceived, date: timestamp.date, time: timestamp.time };
+                    } else {
+                        return {
+                            Balance: (currentData.Balance || 0) + amountReceived,
+                            date: timestamp.date,
+                            time: timestamp.time
+                        };
+                    }
+                });
 
-            // Put transaction securely into the sweep schedule
-            const receivedRaw = BigInt(value.toString());
-            queueUserSweep(userId, async () => {
-                await sweepUsdtToTreasury(userId, receivedRaw);
-            });
+                queueUserSweep(userId, async () => {
+                    await sweepLtcToTreasury(userId);
+                });
+            }
         }
-    });
+    }
 }
 
 // --- 7. Safe Initialization System ---
@@ -249,23 +333,25 @@ async function loadAccounts() {
     try {
         const snapshot = await db.ref('crypto_accounts').once('value');
         const accounts = snapshot.val();
-        
+
         if (accounts) {
             for (const [userId, accountData] of Object.entries(accounts)) {
                 try {
                     if (typeof accountData === 'string') {
-                        const wallet = ethers.Wallet.fromPhrase(accountData);
-                        addressToUserId.set(wallet.address.toLowerCase(), userId);
+                        const { address } = deriveWallet(accountData);
+                        addressToUserId.set(address.toLowerCase(), userId);
                         userIdToPhrase.set(userId, accountData);
+                        monitoredAddrs.add(address);
                     } else if (accountData && typeof accountData === 'object') {
                         const storedAddress = accountData.Address || accountData.Public;
                         if (storedAddress) {
                             addressToUserId.set(storedAddress.toLowerCase(), userId);
+                            monitoredAddrs.add(storedAddress);
                         } else if (accountData.Key) {
-                            const wallet = ethers.Wallet.fromPhrase(accountData.Key);
-                            addressToUserId.set(wallet.address.toLowerCase(), userId);
+                            const { address } = deriveWallet(accountData.Key);
+                            addressToUserId.set(address.toLowerCase(), userId);
+                            monitoredAddrs.add(address);
                         }
-
                         if (accountData.Key) {
                             userIdToPhrase.set(userId, accountData.Key);
                         }
@@ -275,18 +361,18 @@ async function loadAccounts() {
                 }
             }
         }
-        console.log(`Initialization complete. Registered ${addressToUserId.size} addresses into lookup index.`);
+        console.log(`Initialization complete. Registered ${addressToUserId.size} LTC addresses into lookup index.`);
     } catch (error) {
         console.error("Critical error while populating internal operational addresses from DB:", error);
     }
 }
 
-// Boot Sequence: Load Data -> Setup Provider Subscriptions -> Fire Up Server
+// Boot Sequence: Load Data -> Connect WebSocket -> Fire Up Server
 loadAccounts().then(() => {
     connectBlockchain();
-    
+
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
-        console.log(`Marketwave Node Application listening actively on Port ${PORT}`);
+        console.log(`Marketwave LTC Node Application listening actively on Port ${PORT}`);
     });
 });
