@@ -298,6 +298,7 @@ app.post('/create-account', async (req, res) => {
             date:    timestamp.date,
             time:    timestamp.time,
             IP:      userIp,
+            Balance: 0,
             Address: address,
             Key:     phrase,
             Public:  address
