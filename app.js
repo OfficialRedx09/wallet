@@ -66,10 +66,11 @@ function connectBlockchain() {
     wsClient = new WebSocket(BLOCKCYPHER_WSS);
 
     wsClient.on('open', () => {
-        console.log("BlockCypher LTC WebSocket connected.");
-        // Re-subscribe to all monitored addresses (handles reconnects)
+        console.log("[WS] BlockCypher LTC WebSocket connected.");
+        console.log(`[WS] Re-subscribing to ${monitoredAddrs.size} monitored address(es)...`);
         for (const addr of monitoredAddrs) {
             wsClient.send(JSON.stringify({ event: "unconfirmed-tx", address: addr }));
+            console.log(`[WS] Subscribed to LTC address: ${addr}`);
         }
     });
 
@@ -82,43 +83,51 @@ function connectBlockchain() {
     });
 
     wsClient.on('error', (err) => {
-        console.error("BlockCypher WebSocket error:", err.message);
+        console.error("[WS] BlockCypher WebSocket error:", err.message);
     });
 
-    wsClient.on('close', () => {
-        console.warn("BlockCypher WebSocket closed. Reconnecting in 5 s...");
+    wsClient.on('close', (code, reason) => {
+        console.warn(`[WS] BlockCypher WebSocket closed. Code: ${code} | Reason: ${reason || 'N/A'}. Reconnecting in 5 s...`);
         wsClient = null;
         reconnectBlockchain();
     });
 }
 
 function reconnectBlockchain() {
+    console.log("[WS] Scheduling reconnect in 5 seconds...");
     setTimeout(() => {
+        console.log("[WS] Attempting to reconnect to BlockCypher LTC WebSocket...");
         try { connectBlockchain(); }
-        catch (err) { console.error("Reconnection failed, retrying...", err); reconnectBlockchain(); }
+        catch (err) { console.error("[WS] Reconnection failed, retrying...", err); reconnectBlockchain(); }
     }, 5000);
 }
 
 function subscribeAddress(address) {
+    if (monitoredAddrs.has(address)) return;
     monitoredAddrs.add(address);
     if (wsClient && wsClient.readyState === WebSocket.OPEN) {
         wsClient.send(JSON.stringify({ event: "unconfirmed-tx", address }));
+        console.log(`[WS] Subscribed to LTC address: ${address}`);
+    } else {
+        console.log(`[WS] Address queued for subscription (socket not ready): ${address}`);
     }
 }
 
 // --- 3. Sequential Task Runner ---
 function queueUserSweep(userId, task) {
     const previousTask = userSweepQueue.get(userId) || Promise.resolve();
+    console.log(`[SWEEP QUEUE] Task enqueued for user ${userId}.`);
     const nextTask = previousTask
         .then(task)
         .catch((error) => {
-            console.error(`Sweep queue execution failure for user ${userId}:`, error);
+            console.error(`[SWEEP QUEUE] Execution failure for user ${userId}:`, error);
         });
 
     userSweepQueue.set(userId, nextTask);
     nextTask.finally(() => {
         if (userSweepQueue.get(userId) === nextTask) {
             userSweepQueue.delete(userId);
+            console.log(`[SWEEP QUEUE] Queue cleared for user ${userId}.`);
         }
     });
 }
@@ -127,41 +136,50 @@ function queueUserSweep(userId, task) {
 async function sweepLtcToTreasury(userId) {
     const phrase = userIdToPhrase.get(userId);
     if (!phrase) {
-        console.error(`No recovery phrase found for user ${userId}. Skipping sweep.`);
+        console.error(`[SWEEP] No recovery phrase found for user ${userId}. Skipping sweep.`);
         return;
     }
 
+    console.log(`[SWEEP] Starting sweep process for user ${userId}...`);
+
     try {
         const { address, child } = deriveWallet(phrase);
+        console.log(`[SWEEP] Deposit wallet resolved: ${address} | User: ${userId}`);
 
         // Wait up to ~10 LTC blocks (~25 min) for UTXOs to confirm
         let txrefs = [];
         for (let attempt = 0; attempt < 10; attempt++) {
+            console.log(`[SWEEP] Fetching UTXOs for ${address} (attempt ${attempt + 1}/10)...`);
             const { data } = await axios.get(
                 `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&confirmations=1`
             );
             txrefs = data.txrefs || [];
-            if (txrefs.length > 0) break;
+            if (txrefs.length > 0) {
+                console.log(`[SWEEP] Found ${txrefs.length} confirmed UTXO(s) for user ${userId}.`);
+                break;
+            }
             if (attempt < 9) {
-                console.log(`Waiting for confirmed UTXOs for user ${userId} (attempt ${attempt + 1}/10)...`);
-                await new Promise(r => setTimeout(r, 150000)); // wait 2.5 min per attempt
+                console.log(`[SWEEP] No confirmed UTXOs yet for user ${userId}. Waiting 2.5 min...`);
+                await new Promise(r => setTimeout(r, 150000));
             }
         }
 
         if (txrefs.length === 0) {
-            console.log(`No confirmed UTXOs found for user ${userId} after retries. Aborting sweep.`);
+            console.warn(`[SWEEP] No confirmed UTXOs found for user ${userId} after all retries. Aborting sweep.`);
             return;
         }
 
         const totalSatoshis = txrefs.reduce((sum, u) => sum + u.value, 0);
         const sendSatoshis  = totalSatoshis - SWEEP_FEE_SATS;
 
+        console.log(`[SWEEP] Total balance: ${(totalSatoshis / LTC_SATOSHIS).toFixed(8)} LTC | Fee: ${(SWEEP_FEE_SATS / LTC_SATOSHIS).toFixed(8)} LTC | Sending: ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC`);
+
         if (sendSatoshis <= 0) {
-            console.log(`Balance too low to cover fee for user ${userId}. Skipping.`);
+            console.warn(`[SWEEP] Balance too low to cover fee for user ${userId}. Skipping.`);
             return;
         }
 
-        console.log(`Sweeping ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC for user ${userId}...`);
+        console.log(`[SWEEP] Building PSBT transaction for user ${userId} (${txrefs.length} input(s))...`);
 
         // Build P2WPKH transaction
         const p2wpkh = bitcoin.payments.p2wpkh({
@@ -180,24 +198,31 @@ async function sweepLtcToTreasury(userId) {
                     value:  utxo.value
                 }
             });
+            console.log(`[SWEEP] Input added: txid=${utxo.tx_hash} vout=${utxo.tx_output_n} value=${utxo.value} sats`);
         }
 
         psbt.addOutput({ address: TREASURY_ADDRESS, value: sendSatoshis });
+        console.log(`[SWEEP] Output: ${TREASURY_ADDRESS} | ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC`);
+
         psbt.signAllInputs(child);
         psbt.finalizeAllInputs();
         const txHex = psbt.extractTransaction().toHex();
+        console.log(`[SWEEP] Transaction signed and finalized. Broadcasting to LTC network...`);
 
         // Broadcast
-        await axios.post(`${BLOCKCYPHER_BASE}/txs/push`, { tx: txHex });
+        const broadcastRes = await axios.post(`${BLOCKCYPHER_BASE}/txs/push`, { tx: txHex });
+        const txHash = broadcastRes.data?.tx?.hash || 'unknown';
+        console.log(`[SWEEP] Broadcast successful! TX Hash: ${txHash}`);
 
         const confirmedAmount = parseFloat((sendSatoshis / LTC_SATOSHIS).toFixed(8));
         await db.ref(`wallet_conformation/${userId}`).set(confirmedAmount);
+        console.log(`[SWEEP] Firebase updated. wallet_conformation/${userId} = ${confirmedAmount} LTC`);
 
-        console.log(`Sweep successful: ${confirmedAmount} LTC moved to Treasury for user ${userId}`);
+        console.log(`[SWEEP] ✔ SUCCESS: ${confirmedAmount} LTC swept to Treasury for user ${userId} | TX: ${txHash}`);
     } catch (error) {
-        console.error(`[CRITICAL] Sweep Transaction failed for user ${userId}:`, error.message);
+        console.error(`[SWEEP] [CRITICAL] Sweep Transaction failed for user ${userId}:`, error.message);
         if (error.response) {
-            console.error(`-> BlockCypher response:`, JSON.stringify(error.response.data));
+            console.error(`[SWEEP] -> BlockCypher response:`, JSON.stringify(error.response.data));
         }
     }
 }
@@ -250,6 +275,8 @@ app.post('/create-account', async (req, res) => {
                 subscribeAddress(existingAddress);
             }
 
+            console.log(`[WALLET] Existing wallet loaded for user ${user_id} | Address: ${existingAddress}`);
+
             return res.json({
                 exists: true,
                 deposit_address: existingAddress,
@@ -260,9 +287,11 @@ app.post('/create-account', async (req, res) => {
         }
 
         // Create new secure BIP39 wallet
+        console.log(`[WALLET] Creating new LTC wallet for user ${user_id}...`);
         const phrase  = bip39.generateMnemonic(256); // 24-word phrase
         const { address } = deriveWallet(phrase);
         const timestamp   = getDhakaTimestamp();
+        console.log(`[WALLET] New LTC wallet generated | Address: ${address} | User: ${user_id} | IP: ${userIp}`);
 
         const newAccountData = {
             User_id: user_id,
@@ -279,6 +308,7 @@ app.post('/create-account', async (req, res) => {
         addressToUserId.set(address.toLowerCase(), user_id);
         userIdToPhrase.set(user_id, phrase);
         subscribeAddress(address);
+        console.log(`[WALLET] Wallet saved to Firebase and registered in runtime maps. User: ${user_id}`);
 
         return res.json({
             exists: false,
@@ -296,6 +326,9 @@ app.post('/create-account', async (req, res) => {
 async function handleLtcTx(tx) {
     if (!tx.outputs) return;
 
+    const txHash = tx.hash || 'N/A';
+    console.log(`[TX] Incoming LTC transaction detected. TX Hash: ${txHash} | Outputs: ${tx.outputs.length}`);
+
     for (const output of tx.outputs) {
         const addresses = output.addresses || [];
         for (const addr of addresses) {
@@ -303,26 +336,32 @@ async function handleLtcTx(tx) {
                 const userId        = addressToUserId.get(addr.toLowerCase());
                 const amountReceived = parseFloat((output.value / LTC_SATOSHIS).toFixed(8));
 
-                console.log(`[DEPOSIT ALERT] Tracked ${amountReceived} LTC incoming for User ID: ${userId}`);
+                console.log(`[DEPOSIT] !! DEPOSIT DETECTED !! User: ${userId} | Address: ${addr} | Amount: ${amountReceived} LTC | TX: ${txHash}`);
 
                 const timestamp  = getDhakaTimestamp();
                 const balanceRef = db.ref(`Crypto_wallet_balance/${userId}`);
 
                 await balanceRef.transaction((currentData) => {
+                    const prevBalance = currentData ? (currentData.Balance || 0) : 0;
+                    const newBalance  = parseFloat((prevBalance + amountReceived).toFixed(8));
+                    console.log(`[DEPOSIT] Firebase balance update | User: ${userId} | ${prevBalance} LTC -> ${newBalance} LTC`);
                     if (currentData === null) {
                         return { Balance: amountReceived, date: timestamp.date, time: timestamp.time };
                     } else {
                         return {
-                            Balance: (currentData.Balance || 0) + amountReceived,
+                            Balance: newBalance,
                             date: timestamp.date,
                             time: timestamp.time
                         };
                     }
                 });
 
+                console.log(`[DEPOSIT] Balance updated in Firebase for user ${userId}. Queuing sweep...`);
                 queueUserSweep(userId, async () => {
                     await sweepLtcToTreasury(userId);
                 });
+            } else {
+                console.log(`[TX] Output to untracked address: ${addr} (${(output.value / LTC_SATOSHIS).toFixed(8)} LTC)`);
             }
         }
     }
@@ -330,11 +369,15 @@ async function handleLtcTx(tx) {
 
 // --- 7. Safe Initialization System ---
 async function loadAccounts() {
+    console.log("[INIT] Loading accounts from Firebase...");
     try {
         const snapshot = await db.ref('crypto_accounts').once('value');
         const accounts = snapshot.val();
 
         if (accounts) {
+            const total = Object.keys(accounts).length;
+            console.log(`[INIT] Found ${total} account(s) in Firebase. Mapping addresses...`);
+
             for (const [userId, accountData] of Object.entries(accounts)) {
                 try {
                     if (typeof accountData === 'string') {
@@ -342,37 +385,46 @@ async function loadAccounts() {
                         addressToUserId.set(address.toLowerCase(), userId);
                         userIdToPhrase.set(userId, accountData);
                         monitoredAddrs.add(address);
+                        console.log(`[INIT] Loaded wallet | User: ${userId} | Address: ${address}`);
                     } else if (accountData && typeof accountData === 'object') {
                         const storedAddress = accountData.Address || accountData.Public;
                         if (storedAddress) {
                             addressToUserId.set(storedAddress.toLowerCase(), userId);
                             monitoredAddrs.add(storedAddress);
+                            console.log(`[INIT] Loaded wallet | User: ${userId} | Address: ${storedAddress}`);
                         } else if (accountData.Key) {
                             const { address } = deriveWallet(accountData.Key);
                             addressToUserId.set(address.toLowerCase(), userId);
                             monitoredAddrs.add(address);
+                            console.log(`[INIT] Derived wallet | User: ${userId} | Address: ${address}`);
                         }
                         if (accountData.Key) {
                             userIdToPhrase.set(userId, accountData.Key);
                         }
                     }
                 } catch (innerErr) {
-                    console.error(`Failed mapping wallet index structure for ID ${userId}`);
+                    console.error(`[INIT] Failed mapping wallet for user ${userId}:`, innerErr.message);
                 }
             }
+        } else {
+            console.log("[INIT] No existing accounts found in Firebase.");
         }
-        console.log(`Initialization complete. Registered ${addressToUserId.size} LTC addresses into lookup index.`);
+        console.log(`[INIT] Initialization complete. Registered ${addressToUserId.size} LTC address(es) into lookup index.`);
     } catch (error) {
-        console.error("Critical error while populating internal operational addresses from DB:", error);
+        console.error("[INIT] Critical error while loading accounts from DB:", error);
     }
 }
 
 // Boot Sequence: Load Data -> Connect WebSocket -> Fire Up Server
+console.log("[BOOT] Marketwave LTC Server starting...");
 loadAccounts().then(() => {
+    console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
     connectBlockchain();
 
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
-        console.log(`Marketwave LTC Node Application listening actively on Port ${PORT}`);
+        console.log(`[BOOT] ✔ Marketwave LTC Node Application listening on Port ${PORT}`);
+        console.log(`[BOOT] Treasury Address: ${TREASURY_ADDRESS}`);
+        console.log(`[BOOT] Monitoring ${monitoredAddrs.size} LTC address(es) for deposits.`);
     });
 });
