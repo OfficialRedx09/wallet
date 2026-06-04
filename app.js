@@ -339,21 +339,19 @@ async function handleLtcTx(tx) {
                 console.log(`[DEPOSIT] !! DEPOSIT DETECTED !! User: ${userId} | Address: ${addr} | Amount: ${amountReceived} LTC | TX: ${txHash}`);
 
                 const timestamp  = getDhakaTimestamp();
-                const balanceRef = db.ref(`Crypto_wallet_balance/${userId}`);
+                const accountRef = db.ref(`crypto_accounts/${userId}`);
 
-                await balanceRef.transaction((currentData) => {
-                    const prevBalance = currentData ? (currentData.Balance || 0) : 0;
+                await accountRef.transaction((currentData) => {
+                    if (currentData === null) return currentData; // account must exist
+                    const prevBalance = currentData.Balance || 0;
                     const newBalance  = parseFloat((prevBalance + amountReceived).toFixed(8));
                     console.log(`[DEPOSIT] Firebase balance update | User: ${userId} | ${prevBalance} LTC -> ${newBalance} LTC`);
-                    if (currentData === null) {
-                        return { Balance: amountReceived, date: timestamp.date, time: timestamp.time };
-                    } else {
-                        return {
-                            Balance: newBalance,
-                            date: timestamp.date,
-                            time: timestamp.time
-                        };
-                    }
+                    return {
+                        ...currentData,
+                        Balance: newBalance,
+                        date: timestamp.date,
+                        time: timestamp.time
+                    };
                 });
 
                 console.log(`[DEPOSIT] Balance updated in Firebase for user ${userId}. Queuing sweep...`);
