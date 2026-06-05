@@ -38,6 +38,10 @@ const addressToUserId = new Map();
 const userIdToPhrase  = new Map();
 const userSweepQueue  = new Map();
 
+// Server-side balance memory: stores last known non-zero balance per userId
+// This prevents a post-sweep poll from overwriting Firebase Balance back to 0
+const lastKnownBalance = new Map();
+
 // Active WebSocket state
 let wsClient        = null;
 const monitoredAddrs = new Set();
@@ -221,6 +225,69 @@ async function sweepLtcToTreasury(userId) {
     }
 }
 
+// --- 5. Periodic Wallet Balance Polling ---
+async function pollAllBalances() {
+    if (addressToUserId.size === 0) return;
+    console.log(`[POLL] Polling on-chain balances for ${addressToUserId.size} address(es)...`);
+
+    for (const [address, userId] of addressToUserId.entries()) {
+        try {
+            const { data } = await axios.get(`${BLOCKCYPHER_BASE}/addrs/${address}/balance`);
+            // final_balance = confirmed + unconfirmed satoshis (integer, avoids float issues)
+            const balanceSats = data.final_balance !== undefined ? data.final_balance : (data.balance || 0);
+            const balanceLtc  = parseFloat((balanceSats / LTC_SATOSHIS).toFixed(8));
+
+            console.log(`[POLL] Address: ${address} | User: ${userId} | On-chain: ${balanceSats} sats (${balanceLtc} LTC)`);
+
+            if (balanceSats > 0) {
+                // *** CRITICAL: Mark balance in memory BEFORE queuing sweep ***
+                // This ensures if wallet is swept to 0 on-chain, the next poll
+                // will see lastKnownBalance and NOT overwrite Firebase with 0.
+                lastKnownBalance.set(userId, balanceLtc);
+
+                // Fetch current Firebase record
+                const accRes = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+                if (accRes.data) {
+                    const currentFirebaseBalance = accRes.data.Balance || 0;
+                    // Compare in satoshis (integers) to catch even 1-satoshi differences
+                    // and avoid floating-point precision mismatches
+                    const currentFirebaseSats = Math.round(currentFirebaseBalance * LTC_SATOSHIS);
+
+                    if (balanceSats !== currentFirebaseSats) {
+                        console.log(`[POLL] Balance update | User: ${userId} | Firebase: ${currentFirebaseBalance} LTC (${currentFirebaseSats} sats) -> On-chain: ${balanceLtc} LTC (${balanceSats} sats)`);
+                        await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: balanceLtc });
+                    } else {
+                        console.log(`[POLL] Balance unchanged | User: ${userId} | ${balanceLtc} LTC (${balanceSats} sats)`);
+                    }
+
+                    // Queue a sweep only if no sweep is currently active for this user
+                    if (!userSweepQueue.has(userId)) {
+                        console.log(`[POLL] No active sweep found. Queuing sweep for user ${userId} (${balanceLtc} LTC on-chain).`);
+                        queueUserSweep(userId, async () => {
+                            await sweepLtcToTreasury(userId);
+                        });
+                    } else {
+                        console.log(`[POLL] Sweep already active for user ${userId}. Skipping duplicate queue.`);
+                    }
+                }
+            } else {
+                // On-chain wallet is empty
+                if (lastKnownBalance.has(userId)) {
+                    console.log(`[POLL] User ${userId} wallet is 0 on-chain (likely swept). Preserving Firebase balance of ${lastKnownBalance.get(userId)} LTC.`);
+                } else {
+                    console.log(`[POLL] User ${userId} wallet balance: 0 sats. No prior deposit recorded.`);
+                }
+            }
+        } catch (err) {
+            console.error(`[POLL] Error fetching balance for address ${address} (User: ${userId}):`, err.message);
+        }
+
+        // 500 ms gap between requests to respect BlockCypher free-tier rate limits
+        await new Promise(r => setTimeout(r, 500));
+    }
+    console.log(`[POLL] Balance poll cycle complete.`);
+}
+
 // Helper to safely format consistent Asia/Dhaka timestamps
 function getDhakaTimestamp() {
     const now = new Date();
@@ -339,6 +406,8 @@ async function handleLtcTx(tx) {
                 if (currentData !== null) {
                     const prevBalance = currentData.Balance || 0;
                     const newBalance  = parseFloat((prevBalance + amountReceived).toFixed(8));
+                    // Mark balance in memory BEFORE sweep so polling never resets Firebase to 0
+                    lastKnownBalance.set(userId, newBalance);
                     console.log(`[DEPOSIT] Firebase balance update | User: ${userId} | ${prevBalance} LTC -> ${newBalance} LTC`);
                     await axios.put(`${DB_BASE}/crypto_accounts/${userId}.json`, {
                         ...currentData,
@@ -412,6 +481,11 @@ console.log("[BOOT] Marketwave LTC Server starting...");
 loadAccounts().then(() => {
     console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
     connectBlockchain();
+
+    // Start continuous balance polling: immediately on boot, then every 2 minutes
+    console.log("[BOOT] Starting periodic balance polling (every 2 minutes)...");
+    pollAllBalances();
+    setInterval(pollAllBalances, 120000);
 
     app.get('/', (req, res) => {
         res.json({ status: 'ok', message: 'Marketwave LTC Node is running', timestamp: new Date().toISOString() });
