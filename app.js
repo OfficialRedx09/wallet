@@ -48,8 +48,11 @@ const userSweepQueue  = new Map();
 const lastKnownBalance = new Map();
 
 // --- Duel token in-memory state ---
-let duelToken          = null;   // current valid token string
-let duelTokenExpiresAt = 0;      // unix ms when token expires
+// Pre-seeded with the current known valid token.
+// callDuelApi always uses this — client-supplied tokens are never accepted.
+// On security_token_required the token is auto-refreshed via fetchDuelToken().
+let duelToken          = "ZQzOpl94tyKDLnlp5PoEJneonmU3IJ6ckpnW/K6O+gA+";
+let duelTokenExpiresAt = Date.now() + 10 * 60 * 1000; // treat as valid for 10 min from boot
 let duelTokenRefreshing = null;  // in-flight refresh Promise (mutex to prevent concurrent re-fetches)
 
 // Active WebSocket state
@@ -619,9 +622,12 @@ loadAccounts().then(() => {
     console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
     connectBlockchain();
 
-    // Pre-fetch Duel token on boot, then auto-refresh every 590 s (10 s before expiry)
-    console.log("[BOOT] Pre-fetching Duel security token...");
-    fetchDuelToken().catch(err => console.error("[BOOT] Initial Duel token fetch failed:", err.message));
+    // Ensure Duel token is ready; if pre-seeded token is still valid this is a no-op.
+    // Auto-refresh fires every 590 s to keep the token alive proactively.
+    console.log("[BOOT] Verifying Duel security token...");
+    getValidDuelToken()
+        .then(t => console.log(`[BOOT] Duel token ready: ${t.substring(0, 10)}...`))
+        .catch(err => console.error("[BOOT] Initial Duel token check failed:", err.message));
     setInterval(() => {
         console.log("[TOKEN] Auto-refresh: fetching new Duel security token...");
         fetchDuelToken().catch(err => console.error("[TOKEN] Auto-refresh failed:", err.message));
