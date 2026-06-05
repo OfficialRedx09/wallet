@@ -14,6 +14,29 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── Global request/response logger ──────────────────────────────────────────
+// Logs every inbound HTTP request and its final response status/time.
+app.use((req, res, next) => {
+    const start = Date.now();
+    const ip    = req.headers['x-forwarded-for'] || req.ip;
+    console.log(`\n[HTTP] ► ${req.method} ${req.originalUrl} | IP: ${ip}`);
+    if (req.body && Object.keys(req.body).length > 0) {
+        // Redact no sensitive fields here — full visibility requested
+        console.log(`[HTTP]   Body: ${JSON.stringify(req.body)}`);
+    }
+    if (Object.keys(req.query).length > 0) {
+        console.log(`[HTTP]   Query: ${JSON.stringify(req.query)}`);
+    }
+    const origJson  = res.json.bind(res);
+    res.json = (data) => {
+        const ms = Date.now() - start;
+        console.log(`[HTTP] ◄ ${req.method} ${req.originalUrl} | Status: ${res.statusCode} | ${ms}ms | Response: ${JSON.stringify(data)}`);
+        return origJson(data);
+    };
+    next();
+});
+// ────────────────────────────────────────────────────────────────────────────
+
 // --- 2. Litecoin Network Setup ---
 const BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/ltc/main";
 const BLOCKCYPHER_WSS  = "wss://socket.blockcypher.com/v1/ltc/main";
@@ -489,6 +512,7 @@ async function fetchDuelToken() {
 
                 const rawBody   = response.data; // string because responseType:'text'
                 const rawLength = Buffer.byteLength(rawBody, 'utf8');
+                console.log(`[TOKEN] Raw response (attempt ${attempt}): length=${rawLength} bytes | body=${rawBody}`);
 
                 // 112 bytes = the only valid response shape.
                 // Any other length means the token value is wrong/truncated — retry.
@@ -574,9 +598,12 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
         const bodyWithToken = { ...cleanPayload, security_token: token };
 
         console.log(`[DUEL-API] ${method.toUpperCase()} ${url} | token: ${token.substring(0, 12)}...`);
+        console.log(`[DUEL-API] Request headers: ${JSON.stringify({ ...headers, cookie: '[REDACTED]' })}`);
+        console.log(`[DUEL-API] Request body: ${JSON.stringify(bodyWithToken)}`);
 
         try {
             const result = await axios({ method, url, data: bodyWithToken, headers });
+            console.log(`[DUEL-API] Response status: ${result.status} | body: ${JSON.stringify(result.data)}`);
             return result.data;
         } catch (axiosErr) {
             const status  = axiosErr.response?.status;
@@ -647,11 +674,18 @@ app.post('/duel-proxy', async (req, res) => {
     }
 
     const url = `https://duel.com${path}`;
-    console.log(`[DUEL-PROXY] ${method.toUpperCase()} ${url} | payload: ${JSON.stringify(payload ?? {})}`);
+    console.log(`\n[DUEL-PROXY] ══════════════════════════════════════════`);
+    console.log(`[DUEL-PROXY] Client request → ${method.toUpperCase()} ${url}`);
+    console.log(`[DUEL-PROXY] Client payload: ${JSON.stringify(payload ?? {})}`);
+    console.log(`[DUEL-PROXY] ─────────────────────────────────────────────`);
 
     try {
         const duelResponse = await callDuelApi(method, url, payload);
         const outerSuccess = duelResponse?.success !== false;
+        console.log(`[DUEL-PROXY] ─────────────────────────────────────────────`);
+        console.log(`[DUEL-PROXY] Duel full response: ${JSON.stringify(duelResponse)}`);
+        console.log(`[DUEL-PROXY] Result: ${outerSuccess ? '✔ SUCCESS' : '✘ FAILED'} | path: ${path}`);
+        console.log(`[DUEL-PROXY] ══════════════════════════════════════════`);
         if (!outerSuccess) {
             console.warn(`[DUEL-PROXY] Duel returned success:false | path: ${path} | ${JSON.stringify(duelResponse)}`);
         } else {
