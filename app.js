@@ -420,6 +420,10 @@ loadAccounts().then(() => {
     console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
     connectBlockchain();
 
+    app.get('/', (req, res) => {
+        res.json({ status: 'ok', message: 'Marketwave LTC Node is running', timestamp: new Date().toISOString() });
+    });
+
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
         console.log(`[BOOT] ✔ Marketwave LTC Node Application listening on Port ${PORT}`);
