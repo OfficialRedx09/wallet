@@ -50,6 +50,7 @@ const lastKnownBalance = new Map();
 // --- Duel token in-memory state ---
 let duelToken          = null;   // current valid token string
 let duelTokenExpiresAt = 0;      // unix ms when token expires
+let duelTokenRefreshing = null;  // in-flight refresh Promise (mutex to prevent concurrent re-fetches)
 
 // Active WebSocket state
 let wsClient        = null;
@@ -396,43 +397,57 @@ app.post('/create-account', async (req, res) => {
 
 // Internal: fetch a fresh token from Duel and store it in memory
 async function fetchDuelToken() {
-    console.log("[TOKEN] Fetching fresh Duel security token...");
-    const response = await axios.post(
-        DUEL_TOKEN_URL,
-        { uuid: DUEL_DEVICE_UUID, code: "0000", type: "standard" },
-        {
-            headers: {
-                'accept':                    'application/json, text/plain, */*',
-                'accept-language':           'en-GB,en;q=0.6',
-                'content-type':              'application/json',
-                'cookie':                    DUEL_COOKIES,
-                'origin':                    'https://duel.com',
-                'priority':                  'u=1, i',
-                'referer':                   'https://duel.com/dice',
-                'sec-ch-ua':                 '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                'sec-ch-ua-mobile':          '?1',
-                'sec-ch-ua-platform':        '"iOS"',
-                'sec-fetch-dest':            'empty',
-                'sec-fetch-mode':            'cors',
-                'sec-fetch-site':            'same-origin',
-                'sec-gpc':                   '1',
-                'user-agent':                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
-                'x-duel-device-identifier':  DUEL_DEVICE_UUID,
-                'x-env-class':               'blue'
-            }
-        }
-    );
-
-    const body = response.data;
-    if (!body || !body.success || !body.token) {
-        throw new Error(`Duel token API returned non-success: ${JSON.stringify(body)}`);
+    // If a refresh is already in-flight, wait for it instead of making a second request
+    if (duelTokenRefreshing) {
+        console.log("[TOKEN] Refresh already in-flight, waiting...");
+        return duelTokenRefreshing;
     }
 
-    const expiresIn = body.expires_in || 600; // seconds
-    duelToken          = body.token;
-    duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000; // subtract 10 s buffer
-    console.log(`[TOKEN] Token stored. Valid for ~${expiresIn}s (refreshes at ${new Date(duelTokenExpiresAt).toISOString()})`);
-    return duelToken;
+    duelTokenRefreshing = (async () => {
+        console.log("[TOKEN] Fetching fresh Duel security token...");
+        const response = await axios.post(
+            DUEL_TOKEN_URL,
+            { uuid: DUEL_DEVICE_UUID, code: "0000", type: "standard" },
+            {
+                headers: {
+                    'accept':                    'application/json, text/plain, */*',
+                    'accept-language':           'en-GB,en;q=0.6',
+                    'content-type':              'application/json',
+                    'cookie':                    DUEL_COOKIES,
+                    'origin':                    'https://duel.com',
+                    'priority':                  'u=1, i',
+                    'referer':                   'https://duel.com/dice',
+                    'sec-ch-ua':                 '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                    'sec-ch-ua-mobile':          '?1',
+                    'sec-ch-ua-platform':        '"iOS"',
+                    'sec-fetch-dest':            'empty',
+                    'sec-fetch-mode':            'cors',
+                    'sec-fetch-site':            'same-origin',
+                    'sec-gpc':                   '1',
+                    'user-agent':                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+                    'x-duel-device-identifier':  DUEL_DEVICE_UUID,
+                    'x-env-class':               'blue'
+                }
+            }
+        );
+
+        const body = response.data;
+        if (!body || !body.success || !body.token) {
+            throw new Error(`Duel token API returned non-success: ${JSON.stringify(body)}`);
+        }
+
+        const expiresIn = body.expires_in || 600; // seconds
+        duelToken          = body.token;
+        duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000; // subtract 10 s buffer
+        console.log(`[TOKEN] Token stored. Valid for ~${expiresIn}s (refreshes at ${new Date(duelTokenExpiresAt).toISOString()})`);
+        return duelToken;
+    })();
+
+    try {
+        return await duelTokenRefreshing;
+    } finally {
+        duelTokenRefreshing = null;
+    }
 }
 
 // Returns a valid token from memory, fetching a new one only if expired
@@ -445,34 +460,47 @@ async function getValidDuelToken() {
 }
 
 // Makes a Duel API call with the current token.
+// The token is sent BOTH as the x-security-token header AND merged into the
+// request body as "security_token" — Duel requires it in the body.
 // If the response contains security_token_required, fetches a new token and retries once.
 async function callDuelApi(method, url, payload, extraHeaders = {}) {
-    const token = await getValidDuelToken();
-    const headers = {
-        'accept':                   'application/json, text/plain, */*',
-        'accept-language':          'en-GB,en;q=0.6',
-        'content-type':             'application/json',
-        'cookie':                   DUEL_COOKIES,
-        'origin':                   'https://duel.com',
-        'referer':                  'https://duel.com/dice',
-        'user-agent':               'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
-        'x-duel-device-identifier': DUEL_DEVICE_UUID,
-        'x-env-class':              'blue',
-        'x-security-token':         token,
-        ...extraHeaders
+    const makeRequest = async (token) => {
+        const headers = {
+            'accept':                   'application/json, text/plain, */*',
+            'accept-language':          'en-GB,en;q=0.6',
+            'content-type':             'application/json',
+            'cookie':                   DUEL_COOKIES,
+            'origin':                   'https://duel.com',
+            'referer':                  'https://duel.com/dice',
+            'user-agent':               'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+            'x-duel-device-identifier': DUEL_DEVICE_UUID,
+            'x-env-class':              'blue',
+            'x-security-token':         token,
+            ...extraHeaders
+        };
+
+        // Merge security_token into the body — Duel checks the body, not just the header
+        const bodyWithToken = payload ? { ...payload, security_token: token } : { security_token: token };
+
+        const result = await axios({ method, url, data: bodyWithToken, headers });
+        return result.data;
     };
 
-    let result = await axios({ method, url, data: payload, headers });
-    let body = result.data;
+    let token = await getValidDuelToken();
+    let body  = await makeRequest(token);
 
-    // Detect token rejection and retry once with a fresh token
+    // Detect token rejection: refresh once and retry
     if (body && body.security_token_required) {
-        console.warn("[TOKEN] security_token_required received — refreshing token and retrying...");
-        duelToken = null; // force re-fetch
-        const newToken = await fetchDuelToken();
-        headers['x-security-token'] = newToken;
-        result = await axios({ method, url, data: payload, headers });
-        body = result.data;
+        console.warn("[TOKEN] security_token_required — invalidating cached token, refreshing and retrying...");
+        duelToken = null; // force re-fetch (bypass expiry check)
+        token = await fetchDuelToken();
+        body  = await makeRequest(token);
+
+        // If it STILL fails after a fresh token, throw so the caller gets a proper error
+        if (body && body.security_token_required) {
+            console.error("[TOKEN] Still getting security_token_required after refresh. Cookies may be expired.");
+            throw new Error("Duel security token rejected even after refresh — cookies may be expired");
+        }
     }
 
     return body;
