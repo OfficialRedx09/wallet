@@ -160,7 +160,7 @@ async function sweepLtcToTreasury(userId) {
         let txrefs = [];
         for (let attempt = 0; attempt < 10; attempt++) {
             console.log(`[SWEEP] Fetching UTXOs for ${address} (attempt ${attempt + 1}/10)...`);
-            const { data } = await axios.get(
+            const data = await blockCypherGet(
                 `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&confirmations=1`
             );
             txrefs = data.txrefs || [];
@@ -238,66 +238,109 @@ async function sweepLtcToTreasury(userId) {
 }
 
 // --- 5. Periodic Wallet Balance Polling ---
-async function pollAllBalances() {
-    if (addressToUserId.size === 0) return;
-    console.log(`[POLL] Polling on-chain balances for ${addressToUserId.size} address(es)...`);
 
-    for (const [address, userId] of addressToUserId.entries()) {
+// BlockCypher free tier: 3 req/s, 200 req/hour.
+// On 429 we back off exponentially: 15 s -> 30 s -> 60 s -> 120 s -> give up.
+async function blockCypherGet(url, retries = 4) {
+    let delay = 15000; // start at 15 s
+    for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            const { data } = await axios.get(`${BLOCKCYPHER_BASE}/addrs/${address}/balance`);
-            // final_balance = confirmed + unconfirmed satoshis (integer, avoids float issues)
-            const balanceSats = data.final_balance !== undefined ? data.final_balance : (data.balance || 0);
-            const balanceLtc  = parseFloat((balanceSats / LTC_SATOSHIS).toFixed(8));
+            const { data } = await axios.get(url);
+            return data;
+        } catch (err) {
+            const status = err.response?.status;
+            if (status === 429) {
+                const retryAfterHeader = err.response?.headers?.['retry-after'];
+                const waitMs = retryAfterHeader ? parseInt(retryAfterHeader) * 1000 : delay;
+                if (attempt < retries) {
+                    console.warn(`[BLOCKCYPHER] 429 Rate limited on ${url}. Waiting ${waitMs / 1000}s before retry ${attempt}/${retries - 1}...`);
+                    await new Promise(r => setTimeout(r, waitMs));
+                    delay *= 2; // exponential back-off
+                    continue;
+                }
+                console.error(`[BLOCKCYPHER] 429 Rate limit exhausted after ${retries} attempts: ${url}`);
+            }
+            throw err;
+        }
+    }
+}
 
-            console.log(`[POLL] Address: ${address} | User: ${userId} | On-chain: ${balanceSats} sats (${balanceLtc} LTC)`);
+async function pollAllBalances() {
+    if (addressToUserId.size === 0) {
+        console.log('[POLL] No addresses to poll. Skipping.');
+        return;
+    }
 
+    // BlockCypher batch endpoint: fetch ALL addresses in a single HTTP request.
+    // Format: /addrs/addr1;addr2;addr3/balance
+    // Returns an array when multiple addresses are given, an object for one.
+    // 1 request per cycle = well within the 200 req/hour free-tier limit.
+    const addresses = Array.from(addressToUserId.keys()); // already lowercased
+    const batchUrl  = `${BLOCKCYPHER_BASE}/addrs/${addresses.join(';')}/balance`;
+    console.log(`[POLL] Fetching balances for ${addresses.length} address(es) in one batch request...`);
+
+    let results;
+    try {
+        const raw = await blockCypherGet(batchUrl);
+        // Normalise: single address returns object, multiple returns array
+        results = Array.isArray(raw) ? raw : [raw];
+    } catch (err) {
+        console.error(`[POLL] Batch balance fetch failed: ${err.message}`);
+        return;
+    }
+
+    for (const item of results) {
+        const address = item.address?.toLowerCase();
+        if (!address) continue;
+
+        const userId = addressToUserId.get(address);
+        if (!userId) {
+            console.warn(`[POLL] Unknown address in batch response: ${address}`);
+            continue;
+        }
+
+        // final_balance = confirmed + unconfirmed satoshis
+        const balanceSats = item.final_balance !== undefined ? item.final_balance : (item.balance || 0);
+        const balanceLtc  = parseFloat((balanceSats / LTC_SATOSHIS).toFixed(8));
+        console.log(`[POLL] ${address} | User: ${userId} | ${balanceSats} sats (${balanceLtc} LTC)`);
+
+        try {
             if (balanceSats > 0) {
-                // *** CRITICAL: Mark balance in memory BEFORE queuing sweep ***
-                // This ensures if wallet is swept to 0 on-chain, the next poll
-                // will see lastKnownBalance and NOT overwrite Firebase with 0.
+                // Mark in memory BEFORE any sweep so a post-sweep poll never resets Firebase to 0
                 lastKnownBalance.set(userId, balanceLtc);
 
-                // Fetch current Firebase record
                 const accRes = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
                 if (accRes.data) {
                     const currentFirebaseBalance = accRes.data.Balance || 0;
-                    // Compare in satoshis (integers) to catch even 1-satoshi differences
-                    // and avoid floating-point precision mismatches
-                    const currentFirebaseSats = Math.round(currentFirebaseBalance * LTC_SATOSHIS);
+                    const currentFirebaseSats    = Math.round(currentFirebaseBalance * LTC_SATOSHIS);
 
                     if (balanceSats !== currentFirebaseSats) {
-                        console.log(`[POLL] Balance update | User: ${userId} | Firebase: ${currentFirebaseBalance} LTC (${currentFirebaseSats} sats) -> On-chain: ${balanceLtc} LTC (${balanceSats} sats)`);
+                        console.log(`[POLL] Balance update | User: ${userId} | ${currentFirebaseBalance} LTC -> ${balanceLtc} LTC`);
                         await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: balanceLtc });
                     } else {
-                        console.log(`[POLL] Balance unchanged | User: ${userId} | ${balanceLtc} LTC (${balanceSats} sats)`);
+                        console.log(`[POLL] Balance unchanged | User: ${userId} | ${balanceLtc} LTC`);
                     }
 
-                    // Queue a sweep only if no sweep is currently active for this user
                     if (!userSweepQueue.has(userId)) {
-                        console.log(`[POLL] No active sweep found. Queuing sweep for user ${userId} (${balanceLtc} LTC on-chain).`);
-                        queueUserSweep(userId, async () => {
-                            await sweepLtcToTreasury(userId);
-                        });
+                        console.log(`[POLL] Queuing sweep for user ${userId} (${balanceLtc} LTC on-chain).`);
+                        queueUserSweep(userId, () => sweepLtcToTreasury(userId));
                     } else {
-                        console.log(`[POLL] Sweep already active for user ${userId}. Skipping duplicate queue.`);
+                        console.log(`[POLL] Sweep already active for user ${userId}. Skipping.`);
                     }
                 }
             } else {
-                // On-chain wallet is empty
                 if (lastKnownBalance.has(userId)) {
                     console.log(`[POLL] User ${userId} wallet is 0 on-chain (likely swept). Preserving Firebase balance of ${lastKnownBalance.get(userId)} LTC.`);
                 } else {
-                    console.log(`[POLL] User ${userId} wallet balance: 0 sats. No prior deposit recorded.`);
+                    console.log(`[POLL] User ${userId} wallet balance: 0 sats.`);
                 }
             }
         } catch (err) {
-            console.error(`[POLL] Error fetching balance for address ${address} (User: ${userId}):`, err.message);
+            console.error(`[POLL] Firebase update error for user ${userId}: ${err.message}`);
         }
-
-        // 500 ms gap between requests to respect BlockCypher free-tier rate limits
-        await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`[POLL] Balance poll cycle complete.`);
+
+    console.log(`[POLL] Poll cycle complete. Next poll in 60 s.`);
 }
 
 // Helper to safely format consistent Asia/Dhaka timestamps
@@ -397,52 +440,87 @@ app.post('/create-account', async (req, res) => {
 
 // --- 6. Route: Get Duel Security Token ---
 
-// Internal: fetch a fresh token from Duel and store it in memory
+// Internal: fetch a fresh token from Duel and store it in memory.
+// Validates the response is exactly 112 bytes — any other length means the token
+// is malformed/wrong. Retries up to 10 times until a valid 112-byte response is received.
 async function fetchDuelToken() {
-    // If a refresh is already in-flight, wait for it instead of making a second request
     if (duelTokenRefreshing) {
         console.log("[TOKEN] Refresh already in-flight, waiting...");
         return duelTokenRefreshing;
     }
 
     duelTokenRefreshing = (async () => {
-        console.log("[TOKEN] Fetching fresh Duel security token...");
-        const response = await axios.post(
-            DUEL_TOKEN_URL,
-            { uuid: DUEL_DEVICE_UUID, code: "0000", type: "standard" },
-            {
-                headers: {
-                    'accept':                    'application/json, text/plain, */*',
-                    'accept-language':           'en-GB,en;q=0.6',
-                    'content-type':              'application/json',
-                    'cookie':                    DUEL_COOKIES,
-                    'origin':                    'https://duel.com',
-                    'priority':                  'u=1, i',
-                    'referer':                   'https://duel.com/dice',
-                    'sec-ch-ua':                 '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                    'sec-ch-ua-mobile':          '?1',
-                    'sec-ch-ua-platform':        '"iOS"',
-                    'sec-fetch-dest':            'empty',
-                    'sec-fetch-mode':            'cors',
-                    'sec-fetch-site':            'same-origin',
-                    'sec-gpc':                   '1',
-                    'user-agent':                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
-                    'x-duel-device-identifier':  DUEL_DEVICE_UUID,
-                    'x-env-class':               'blue'
+        const MAX_ATTEMPTS = 10;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            console.log(`[TOKEN] Fetching Duel security token (attempt ${attempt}/${MAX_ATTEMPTS})...`);
+            try {
+                const response = await axios.post(
+                    DUEL_TOKEN_URL,
+                    { uuid: DUEL_DEVICE_UUID, code: "0000", type: "standard" },
+                    {
+                        responseType: 'text', // raw string so we can measure exact byte length
+                        headers: {
+                            'accept':                      'application/json, text/plain, */*',
+                            'accept-encoding':             'gzip, deflate, br, zstd',
+                            'accept-language':             'en-GB,en;q=0.6',
+                            'content-type':                'application/json',
+                            'cookie':                      DUEL_COOKIES,
+                            'origin':                      'https://duel.com',
+                            'priority':                    'u=1, i',
+                            'referer':                     'https://duel.com/dice',
+                            'sec-ch-ua':                   '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                            'sec-ch-ua-arch':              '""',
+                            'sec-ch-ua-bitness':           '"64"',
+                            'sec-ch-ua-full-version-list': '"Brave";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"',
+                            'sec-ch-ua-mobile':            '?1',
+                            'sec-ch-ua-model':             '"iPhone"',
+                            'sec-ch-ua-platform':          '"iOS"',
+                            'sec-ch-ua-platform-version':  '"18.5"',
+                            'sec-fetch-dest':              'empty',
+                            'sec-fetch-mode':              'cors',
+                            'sec-fetch-site':              'same-origin',
+                            'sec-gpc':                     '1',
+                            'user-agent':                  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+                            'x-duel-device-identifier':    DUEL_DEVICE_UUID,
+                            'x-env-class':                 'blue'
+                        }
+                    }
+                );
+
+                const rawBody   = response.data; // string because responseType:'text'
+                const rawLength = Buffer.byteLength(rawBody, 'utf8');
+
+                // 112 bytes = the only valid response shape.
+                // Any other length means the token value is wrong/truncated — retry.
+                if (rawLength !== 112) {
+                    console.warn(`[TOKEN] Response length ${rawLength} ≠ 112. Token is invalid. Retrying...`);
+                    if (attempt < MAX_ATTEMPTS) continue;
+                    throw new Error(`Duel token response length ${rawLength} ≠ 112 after ${MAX_ATTEMPTS} attempts`);
                 }
+
+                const body = JSON.parse(rawBody);
+                if (!body.success || !body.token) {
+                    console.warn(`[TOKEN] Parsed body missing success/token. Retrying...`);
+                    if (attempt < MAX_ATTEMPTS) continue;
+                    throw new Error(`Duel token API returned non-success after ${MAX_ATTEMPTS} attempts`);
+                }
+
+                const expiresIn    = body.expires_in || 600;
+                duelToken          = body.token;
+                duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000;
+                console.log(`[TOKEN] Valid token obtained (${rawLength} bytes | ${duelToken.substring(0, 12)}...). Expires in ~${expiresIn}s.`);
+                return duelToken;
+
+            } catch (err) {
+                if (err.response) {
+                    console.error(`[TOKEN] HTTP ${err.response.status} on attempt ${attempt}: ${JSON.stringify(err.response.data)}`);
+                } else {
+                    console.error(`[TOKEN] Error on attempt ${attempt}: ${err.message}`);
+                }
+                if (attempt >= MAX_ATTEMPTS) throw err;
+                await new Promise(r => setTimeout(r, 1000)); // 1 s pause before retry
             }
-        );
-
-        const body = response.data;
-        if (!body || !body.success || !body.token) {
-            throw new Error(`Duel token API returned non-success: ${JSON.stringify(body)}`);
         }
-
-        const expiresIn = body.expires_in || 600; // seconds
-        duelToken          = body.token;
-        duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000; // subtract 10 s buffer
-        console.log(`[TOKEN] Token stored. Valid for ~${expiresIn}s (refreshes at ${new Date(duelTokenExpiresAt).toISOString()})`);
-        return duelToken;
     })();
 
     try {
@@ -480,8 +558,10 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
             'x-security-token':         token,
             ...extraHeaders
         };
-        // Duel requires the token in the request body too
-        const bodyWithToken = payload ? { ...payload, security_token: token } : { security_token: token };
+        // Strip any security_token the client may have sent — always use the server-managed one.
+        const cleanPayload = payload ? { ...payload } : {};
+        delete cleanPayload.security_token;
+        const bodyWithToken = { ...cleanPayload, security_token: token };
 
         console.log(`[DUEL-API] ${method.toUpperCase()} ${url} | token: ${token.substring(0, 12)}...`);
 
@@ -492,8 +572,6 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
             const status  = axiosErr.response?.status;
             const errBody = axiosErr.response?.data;
             console.error(`[DUEL-API] HTTP ${status ?? 'N/A'} from Duel | URL: ${url} | Body: ${JSON.stringify(errBody ?? axiosErr.message)}`);
-            // Duel sometimes returns security_token_required inside a 4xx body.
-            // Return the body so the retry logic below can catch it instead of hard-throwing.
             if (errBody && errBody.security_token_required) {
                 console.warn(`[DUEL-API] security_token_required detected in HTTP ${status} error body. Will refresh token.`);
                 return errBody;
@@ -689,10 +767,12 @@ loadAccounts().then(() => {
         fetchDuelToken().catch(err => console.error("[TOKEN] Auto-refresh failed:", err.message));
     }, 590 * 1000);
 
-    // Start continuous balance polling: immediately on boot, then every 2 minutes
-    console.log("[BOOT] Starting periodic balance polling (every 2 minutes)...");
+    // Poll all balances every 60 seconds using the BlockCypher batch endpoint.
+    // Batch = 1 HTTP request for ALL addresses regardless of user count.
+    // 60 req/hour is well within BlockCypher's 200 req/hour free-tier limit.
+    console.log("[BOOT] Starting balance polling every 60 seconds (batch mode)...");
     pollAllBalances();
-    setInterval(pollAllBalances, 120000);
+    setInterval(pollAllBalances, 60000);
 
     app.get('/', (req, res) => {
         res.json({ status: 'ok', message: 'Marketwave LTC Node is running', timestamp: new Date().toISOString() });
