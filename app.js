@@ -113,7 +113,7 @@ function formatHint(r) {
 function createSession(userId) {
     const state = {};
     STRATEGY_DEFS.forEach(d => { state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
-    return { userId, isRunning: false, activeKeys: [], mtgLevel: 1, complexMode: false, state, totalTrades: 0, totalProfit: 0, sseClients: new Set() };
+    return { userId, isRunning: false, stopWhenSafe: false, activeKeys: [], mtgLevel: 1, complexMode: false, state, totalTrades: 0, totalProfit: 0, sseClients: new Set() };
 }
 function pushEvent(session, event) {
     if (!session.sseClients.size) return;
@@ -122,6 +122,35 @@ function pushEvent(session, event) {
         try { client.write(data); } catch (_) { session.sseClients.delete(client); }
     }
 }
+
+// ── Firebase balance helpers ─────────────────────────────────────────────────
+// Read current Balance from Firebase; returns null on DB error.
+async function getUserBalance(userId) {
+    try {
+        const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+        return parseFloat(snap.data?.Balance ?? snap.data?.AccumulatedBalance ?? 0) || 0;
+    } catch (err) {
+        console.error(`[BALANCE-CHECK] Failed to get balance for ${userId}: ${err.message}`);
+        return null; // null signals a DB error to the caller
+    }
+}
+
+// Add delta (positive = win, negative = loss) to Balance and persist.
+// Returns new balance or null on DB error. Balance is floored at 0.
+async function adjustUserBalance(userId, delta) {
+    try {
+        const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+        const current = parseFloat(snap.data?.Balance ?? 0) || 0;
+        const newBal  = Math.max(0, parseFloat((current + delta).toFixed(8)));
+        await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal });
+        console.log(`[BALANCE] ${userId}: ${current.toFixed(8)} ${delta >= 0 ? '+' : ''}${delta.toFixed(8)} → ${newBal.toFixed(8)} LTC`);
+        return newBal;
+    } catch (err) {
+        console.error(`[BALANCE] Failed to adjust balance for ${userId}: ${err.message}`);
+        return null;
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Derive a native-segwit (bech32 ltc1...) wallet from a BIP39 mnemonic
 function deriveWallet(phrase) {
@@ -232,11 +261,6 @@ async function sweepLtcToTreasury(userId) {
                 if (txrefs.length > 0) break;
             } catch (utxoErr) {
                 console.error(`[SWEEP] UTXO fetch error: ${utxoErr.message}`);
-            }
-            txrefs = data.txrefs || [];
-            if (txrefs.length > 0) {
-                console.log(`[SWEEP] Found ${txrefs.length} confirmed UTXO(s) for user ${userId}.`);
-                break;
             }
             if (attempt < 9) {
                 console.log(`[SWEEP] No confirmed UTXOs yet. Waiting 2.5 min...`);
@@ -814,12 +838,26 @@ async function runStrategyTick(session, key) {
     } else {
         const bet  = session.complexMode ? getComplexBet(state.betStep, seq) : (seq[state.betStep] ?? seq[seq.length - 1]);
         const step = state.betStep + 1;
-        pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — $${bet}`, logType: 'system' });
+
+        // ── Safety: check Firebase balance BEFORE placing any real bet ────────
+        const currentBalance = await getUserBalance(session.userId);
+        if (currentBalance === null) {
+            pushEvent(session, { type: 'error', code: 'DB_ERROR', message: 'Database error reading balance', detail: `Cannot read balance for user ${session.userId} from Firebase`, action: 'Check Firebase connectivity — retrying next tick' });
+            return;
+        }
+        if (currentBalance < bet) {
+            pushEvent(session, { type: 'error', code: 'INSUFFICIENT_BALANCE', message: 'Insufficient balance to place bet', detail: `Available: ${currentBalance.toFixed(8)} LTC  |  Required: ${bet.toFixed(8)} LTC`, action: 'Strategy stopped — deposit funds to continue' });
+            session.isRunning = false;
+            return;
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
+        pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — $${bet}  (Bal: ${currentBalance.toFixed(4)} LTC)`, logType: 'system' });
         pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: null });
 
         const r = await placeDiceBet(bet);
         if (!r.success) {
-            pushEvent(session, { type: 'log', message: `[${def.name}] API error: ${r.error}`, logType: 'error' });
+            pushEvent(session, { type: 'error', code: 'BET_FAILED', message: `Bet failed: ${r.error}`, detail: `Strategy: ${def.name} | Step: ${step}/${seq.length} | Amount: $${bet}`, action: /rejected|expired|cookie/i.test(r.error) ? 'Update DUEL_COOKIES on server — strategy stopped' : 'Retrying next tick' });
             if (/rejected|expired|cookie/i.test(r.error)) session.isRunning = false;
             return;
         }
@@ -829,12 +867,20 @@ async function runStrategyTick(session, key) {
             pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'win' });
             pushEvent(session, { type: 'log', message: `  [${def.name}] COIN FOUND  +$${bet.toFixed(4)}  |  Net: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)} | ${formatRound(r.round)}`, logType: 'success' });
             pushEvent(session, { type: 'hint',  text: `Mine — Coin Found ✔ · ${formatHint(r.round)}` });
+            // ── Update Firebase: +bet on win ────────────────────────────────
+            const newBal = await adjustUserBalance(session.userId, bet);
+            if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: bet });
+            // ────────────────────────────────────────────────────────────────
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
         } else {
             session.totalProfit = +(session.totalProfit - bet).toFixed(8);
             pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'loss' });
             pushEvent(session, { type: 'log', message: `  [${def.name}] NO COIN  -$${bet.toFixed(4)}  |  Net: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)} | ${formatRound(r.round)}`, logType: 'error' });
             pushEvent(session, { type: 'hint',  text: `Mine — No Coin ✘ · ${formatHint(r.round)}` });
+            // ── Update Firebase: -bet on loss ───────────────────────────────
+            const newBal = await adjustUserBalance(session.userId, -bet);
+            if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: -bet });
+            // ────────────────────────────────────────────────────────────────
             state.betStep++;
             if (state.betStep >= seq.length) {
                 pushEvent(session, { type: 'log', message: `  [${def.name}] Limit (Level ${session.mtgLevel}) reached — reset`, logType: 'warn' });
@@ -846,7 +892,8 @@ async function runStrategyTick(session, key) {
 }
 
 async function startStrategyLoop(session) {
-    session.isRunning = true;
+    session.isRunning    = true;
+    session.stopWhenSafe = false;
     const seq = getMtgSequence(session.mtgLevel);
     pushEvent(session, { type: 'started', mtgLevel: session.mtgLevel, complexMode: session.complexMode, strategies: session.activeKeys, sequence: seq });
     try {
@@ -856,13 +903,28 @@ async function startStrategyLoop(session) {
                 if (!session.isRunning) break;
                 await runStrategyTick(session, key);
             }
+            // ── Connection-loss safe stop ──────────────────────────────────────
+            // If all SSE clients disconnected (power loss, browser close, etc.),
+            // only stop when SAFE: all active strategies are in 'waiting' phase.
+            // This prevents leaving an incomplete MTG sequence mid-loss.
+            if (session.stopWhenSafe && session.isRunning) {
+                const allWaiting = session.activeKeys.every(k => session.state[k]?.phase === 'waiting');
+                if (allWaiting) {
+                    console.log(`[STRATEGY] Safe stop for ${session.userId} — all strategies at waiting phase`);
+                    session.isRunning = false;
+                    break;
+                }
+                console.log(`[STRATEGY] Safe stop pending for ${session.userId} — MTG set in progress, continuing...`);
+            }
+            // ─────────────────────────────────────────────────────────────────
             if (session.isRunning) await sleep(800);
         }
     } catch (err) {
         console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
         pushEvent(session, { type: 'log', message: `[ERROR] Loop crashed: ${err.message}`, logType: 'error' });
     }
-    session.isRunning = false;
+    session.isRunning    = false;
+    session.stopWhenSafe = false;
     pushEvent(session, { type: 'stopped', totalTrades: session.totalTrades, totalProfit: session.totalProfit });
     console.log(`[STRATEGY] Ended for ${session.userId} | trades:${session.totalTrades} profit:${session.totalProfit}`);
 }
@@ -878,10 +940,24 @@ app.get('/strategy/events', (req, res) => {
     res.flushHeaders();
     if (!strategySessions.has(userId)) strategySessions.set(userId, createSession(userId));
     const session = strategySessions.get(userId);
+    // If client reconnects while a safe-stop was pending, cancel it
+    if (session.stopWhenSafe && session.isRunning) {
+        session.stopWhenSafe = false;
+        console.log(`[SSE] Client reconnected for ${userId} — safe-stop cancelled, continuing strategy.`);
+        pushEvent(session, { type: 'log', message: '[SAFETY] Client reconnected — strategy continues.', logType: 'system' });
+    }
     session.sseClients.add(res);
     res.write(`data: ${JSON.stringify({ type: 'connected', isRunning: session.isRunning, totalTrades: session.totalTrades, totalProfit: session.totalProfit })}\n\n`);
     const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) { clearInterval(hb); } }, 25000);
-    req.on('close', () => { session.sseClients.delete(res); clearInterval(hb); });
+    req.on('close', () => {
+        session.sseClients.delete(res);
+        clearInterval(hb);
+        // If no clients remain and strategy is running, request a safe stop
+        if (session.isRunning && session.sseClients.size === 0) {
+            console.log(`[SSE] All clients disconnected for ${userId}. Requesting safe stop after current MTG set...`);
+            session.stopWhenSafe = true;
+        }
+    });
 });
 
 // Route: start strategy
