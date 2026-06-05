@@ -541,8 +541,18 @@ async function getValidDuelToken() {
 
 // Makes a Duel API call with the server-managed token.
 // Token is injected into BOTH the x-security-token header AND the request body.
-// On security_token_required (in body OR in an HTTP 4xx response) the token is
-// invalidated, a fresh one is fetched, and the call is retried exactly once.
+// Detects BOTH token-rejection shapes Duel returns:
+//   Shape A: { security_token_required: true }
+//   Shape B: { success: false, message: "security_token is required" }
+// On either, invalidates the cached token, fetches a fresh one, and retries once.
+function isTokenError(body) {
+    if (!body) return false;
+    if (body.security_token_required) return true;
+    if (body.success === false && typeof body.message === 'string' &&
+        body.message.toLowerCase().includes('security_token')) return true;
+    return false;
+}
+
 async function callDuelApi(method, url, payload, extraHeaders = {}) {
     const makeRequest = async (token) => {
         const headers = {
@@ -572,8 +582,8 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
             const status  = axiosErr.response?.status;
             const errBody = axiosErr.response?.data;
             console.error(`[DUEL-API] HTTP ${status ?? 'N/A'} from Duel | URL: ${url} | Body: ${JSON.stringify(errBody ?? axiosErr.message)}`);
-            if (errBody && errBody.security_token_required) {
-                console.warn(`[DUEL-API] security_token_required detected in HTTP ${status} error body. Will refresh token.`);
+            if (errBody && isTokenError(errBody)) {
+                console.warn(`[DUEL-API] Token error detected in HTTP ${status} error body. Will refresh token.`);
                 return errBody;
             }
             throw axiosErr;
@@ -584,9 +594,9 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
     let body  = await makeRequest(token);
 
     // ---- Token rejection: refresh + single retry ----
-    if (body && body.security_token_required) {
-        console.warn(`[DUEL-API] security_token_required in response body. Invalidating cached token and refreshing...`);
-        duelToken = null; // force re-fetch on next getValidDuelToken call
+    if (isTokenError(body)) {
+        console.warn(`[DUEL-API] Token error detected: ${JSON.stringify(body)}. Invalidating cached token and refreshing...`);
+        duelToken = null;
         try {
             token = await fetchDuelToken();
         } catch (refreshErr) {
@@ -596,9 +606,9 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
         console.log(`[DUEL-API] Retrying with fresh token: ${token.substring(0, 12)}...`);
         body = await makeRequest(token);
 
-        if (body && body.security_token_required) {
-            console.error(`[DUEL-API] security_token_required STILL present after refresh. Cookies are likely expired. Update DUEL_COOKIES in the server config.`);
-            throw new Error('Duel security token rejected after refresh — DUEL_COOKIES may be expired');
+        if (isTokenError(body)) {
+            console.error(`[DUEL-API] Token error STILL present after refresh: ${JSON.stringify(body)}. Cookies are likely expired. Update DUEL_COOKIES in the server config.`);
+            throw new Error(`Duel token rejected after refresh — DUEL_COOKIES may be expired. Server response: ${JSON.stringify(body)}`);
         }
     }
 
