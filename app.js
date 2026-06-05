@@ -58,28 +58,70 @@ const LITECOIN_NETWORK = {
 
 // --- Duel.com Token Config ---
 const DUEL_TOKEN_URL    = "https://duel.com/api/v2/user/security/token";
+const DUEL_BET_URL      = "https://duel.com/api/v2/dice/bet";
+const BLOCKCHAIR_BASE   = "https://api.blockchair.com/litecoin";
 const DUEL_DEVICE_UUID  = process.env.DUEL_DEVICE_UUID  || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
 const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "duel=ZetFwwIEJuC2L6kZNiAYQyQwnc9CyfgErVtqcwWA; do_not_share_this_with_anyone_not_even_staff=4975939_l09WQ6ZeqD8HWQDGnBi4PbGavFTvhDwX7tB7A8jAlYrrldcNPEglAW2Gw3Ik; cf_clearance=fOrtE9TNoPnxCGxIeGJfHvuKPt8i2hlZTQa_vJWPmVM-1780691376-1.2.1.1-D3IhI9XEARs0VQLjhRsLPZV9uja2Jm08LF0v3Uvx1S0VaDcMCqXPrPSTEq254BnP0ZPRYsij5U6IfRYATZJjBrDaGn2eebjVfd6DraH_1hTgb7ET6FllTn6sFxQTjLatfItEc5UJithCLExCEg4IqyrzI1IZz01RSTgrH_a9zxtR9krqAQa5ko6nnjrSVV7piek8DBE2Wp_GqlgeJAsNgQgZbXKa8FIzJcBDmyVPI2HbqiAq.7B1y9jpINCOfxT7TH5iKKKoYRfR_FM64dVeiUjy9lgcQI9FfqqhelFT08zg5kB0lZlMFY7NUzIIc2UjRfOdXkzyQvznVJwYVjYa_xVno1S7O3R461G8sqQbW7Mn5UOs4WjtSinpeAF9kuM17_IOa35EQKs0aeH33w.7ey4K.4Hyd0A4xH4jzUe8O2I; _sp_id.d35b=c754ce38-2a8f-4af7-8e2a-f7eec01bcc1b.1780527197.14.1780697027.1780690862.db9e315d-f57e-4044-aeef-ed44a9ae1858.0a317223-81b0-49c2-8491-708259c73d2f.577ce2b2-7551-4493-9899-05dd0d02fafa.1780694274209.7; __cf_bm=dat5EqnwqubNMLrQmCEl2EgckQFhkdHqEGWR3faVHLI-1780697967.8603165-1.0.1.1-5lGbotWeCsQ037AderatEGXKIThjnLTVLetXNcz.HmrgLGrKTj94P80egiyDSEOXVK0jhZT2DavgcCmbhriDU5VMToiDOPfAHdDxkI6dVIzS_ceGhwOqiufR94oxl.Eo; env_class=blue";
 
 // Core Lookup Maps
-const addressToUserId = new Map();
-const userIdToPhrase  = new Map();
-const userSweepQueue  = new Map();
+const addressToUserId        = new Map();
+const userIdToPhrase         = new Map();
+const userSweepQueue         = new Map();
+const lastOnChainSats        = new Map(); // userId -> last polled on-chain sats (detects new deposits)
+const userAccumulatedBalance = new Map(); // userId -> lifetime accumulated LTC (never decreases after sweep)
+const strategySessions       = new Map(); // userId -> strategy session
 
-// Server-side balance memory: stores last known non-zero balance per userId
-// This prevents a post-sweep poll from overwriting Firebase Balance back to 0
-const lastKnownBalance = new Map();
-
-// --- Duel token in-memory state ---
-// Always fetched fresh on boot — never trust a hardcoded token as Duel tokens expire in 600 s.
-// callDuelApi always uses the server-managed token; client-supplied tokens are ignored.
+// Duel token state
 let duelToken           = null;
 let duelTokenExpiresAt  = 0;
-let duelTokenRefreshing = null; // mutex: prevents concurrent refresh requests
+let duelTokenRefreshing = null;
 
-// Active WebSocket state
-let wsClient        = null;
+// WebSocket state
+let wsClient         = null;
 const monitoredAddrs = new Set();
+
+// ─── Utilities & Strategy Helpers ────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+const STRATEGY_DEFS = [
+    { key: 'scalp',     name: 'Strategy 1', waitFor: 3 },
+    { key: 'arbitrage', name: 'Strategy 2', waitFor: 4 },
+    { key: 'dca',       name: 'Strategy 3', waitFor: 5 },
+    { key: 'momentum',  name: 'Strategy 4', waitFor: 6 },
+    { key: 'grid',      name: 'Strategy 5', waitFor: 7 },
+    { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
+];
+const COMPLEX_BETS = [[0.01, 0.02, 0.03], [0.02, 0.04], [0.04, 0.06]];
+
+function getMtgSequence(level) {
+    const seq = [0.01];
+    for (let i = 0; i < level; i++) seq.push(+(seq[seq.length - 1] * 2).toFixed(8));
+    return seq;
+}
+function getComplexBet(step, seq) {
+    const pool = COMPLEX_BETS[step];
+    return pool ? pool[Math.floor(Math.random() * pool.length)] : (seq[step] !== undefined ? seq[step] : seq[seq.length - 1]);
+}
+function formatRound(r) {
+    const d = r.bet_type === 'under' ? '<' : '>';
+    return `#${r.nonce}  |  ${r.result} ${d} ${r.target}  |  ×${parseFloat(r.multiplier).toFixed(4)}  |  TX:${r.transaction_id}`;
+}
+function formatHint(r) {
+    const d = r.bet_type === 'under' ? '<' : '>';
+    return `${r.result} ${d} ${r.target} · ×${parseFloat(r.multiplier).toFixed(4)}`;
+}
+function createSession(userId) {
+    const state = {};
+    STRATEGY_DEFS.forEach(d => { state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
+    return { userId, isRunning: false, activeKeys: [], mtgLevel: 1, complexMode: false, state, totalTrades: 0, totalProfit: 0, sseClients: new Set() };
+}
+function pushEvent(session, event) {
+    if (!session.sseClients.size) return;
+    const data = `data: ${JSON.stringify(event)}\n\n`;
+    for (const client of [...session.sseClients]) {
+        try { client.write(data); } catch (_) { session.sseClients.delete(client); }
+    }
+}
 
 // Derive a native-segwit (bech32 ltc1...) wallet from a BIP39 mnemonic
 function deriveWallet(phrase) {
@@ -183,17 +225,22 @@ async function sweepLtcToTreasury(userId) {
         let txrefs = [];
         for (let attempt = 0; attempt < 10; attempt++) {
             console.log(`[SWEEP] Fetching UTXOs for ${address} (attempt ${attempt + 1}/10)...`);
-            const data = await blockCypherGet(
-                `${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&confirmations=1`
-            );
+            try {
+                const { txrefs: refs, source } = await getAddressUtxosWithFallback(address);
+                txrefs = refs.filter(u => u.confirmations >= 1);
+                console.log(`[SWEEP] ${txrefs.length} UTXO(s) from ${source}.`);
+                if (txrefs.length > 0) break;
+            } catch (utxoErr) {
+                console.error(`[SWEEP] UTXO fetch error: ${utxoErr.message}`);
+            }
             txrefs = data.txrefs || [];
             if (txrefs.length > 0) {
                 console.log(`[SWEEP] Found ${txrefs.length} confirmed UTXO(s) for user ${userId}.`);
                 break;
             }
             if (attempt < 9) {
-                console.log(`[SWEEP] No confirmed UTXOs yet for user ${userId}. Waiting 2.5 min...`);
-                await new Promise(r => setTimeout(r, 150000));
+                console.log(`[SWEEP] No confirmed UTXOs yet. Waiting 2.5 min...`);
+                await sleep(150000);
             }
         }
 
@@ -249,9 +296,8 @@ async function sweepLtcToTreasury(userId) {
 
         const confirmedAmount = parseFloat((sendSatoshis / LTC_SATOSHIS).toFixed(8));
         await axios.put(`${DB_BASE}/wallet_conformation/${userId}.json`, confirmedAmount);
-        console.log(`[SWEEP] Firebase updated. wallet_conformation/${userId} = ${confirmedAmount} LTC`);
-
-        console.log(`[SWEEP] ✔ SUCCESS: ${confirmedAmount} LTC swept to Treasury for user ${userId} | TX: ${txHash}`);
+        lastOnChainSats.set(userId, 0); // on-chain is now 0; accumulated balance in Firebase is preserved
+        console.log(`[SWEEP] ✔ SUCCESS: ${confirmedAmount} LTC swept | TX: ${txHash}`);
     } catch (error) {
         console.error(`[SWEEP] [CRITICAL] Sweep Transaction failed for user ${userId}:`, error.message);
         if (error.response) {
@@ -261,6 +307,39 @@ async function sweepLtcToTreasury(userId) {
 }
 
 // --- 5. Periodic Wallet Balance Polling ---
+
+// Blockchair fallback for balance and UTXOs when BlockCypher is down / rate-limited
+async function getAddressBalanceWithFallback(address) {
+    try {
+        const data = await blockCypherGet(`${BLOCKCYPHER_BASE}/addrs/${address}/balance`);
+        return { final_balance: data.final_balance ?? 0, source: 'blockcypher' };
+    } catch (err) {
+        console.warn(`[BALANCE] BlockCypher failed for ${address}: ${err.message}. Trying Blockchair...`);
+        const res = await axios.get(`${BLOCKCHAIR_BASE}/dashboards/address/${address}`, { timeout: 12000 });
+        const addrData = res.data?.data?.[address]?.address;
+        return { final_balance: parseInt(addrData?.balance ?? '0', 10) || 0, source: 'blockchair' };
+    }
+}
+
+async function getAddressUtxosWithFallback(address) {
+    try {
+        const data = await blockCypherGet(`${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&confirmations=1`);
+        return { txrefs: data.txrefs || [], source: 'blockcypher' };
+    } catch (err) {
+        console.warn(`[UTXO] BlockCypher failed for ${address}: ${err.message}. Trying Blockchair...`);
+        const res = await axios.get(
+            `${BLOCKCHAIR_BASE}/outputs?q=recipient(${address}),is_spent(false)&limit=100`,
+            { timeout: 15000 }
+        );
+        const txrefs = (res.data?.data ?? []).map(o => ({
+            tx_hash:      o.transaction_hash,
+            tx_output_n:  o.index,
+            value:        o.value,
+            confirmations: o.block_id ? 1 : 0
+        }));
+        return { txrefs, source: 'blockchair' };
+    }
+}
 
 // BlockCypher free tier: 3 req/s, 200 req/hour.
 // On 429 we back off exponentially: 15 s -> 30 s -> 60 s -> 120 s -> give up.
@@ -289,81 +368,70 @@ async function blockCypherGet(url, retries = 4) {
 }
 
 async function pollAllBalances() {
-    if (addressToUserId.size === 0) {
-        console.log('[POLL] No addresses to poll. Skipping.');
-        return;
-    }
+    if (!addressToUserId.size) { console.log('[POLL] No addresses to poll.'); return; }
 
-    // BlockCypher batch endpoint: fetch ALL addresses in a single HTTP request.
-    // Format: /addrs/addr1;addr2;addr3/balance
-    // Returns an array when multiple addresses are given, an object for one.
-    // 1 request per cycle = well within the 200 req/hour free-tier limit.
-    const addresses = Array.from(addressToUserId.keys()); // already lowercased
-    const batchUrl  = `${BLOCKCYPHER_BASE}/addrs/${addresses.join(';')}/balance`;
-    console.log(`[POLL] Fetching balances for ${addresses.length} address(es) in one batch request...`);
+    const addresses = Array.from(addressToUserId.keys());
+    console.log(`[POLL] Polling ${addresses.length} address(es)...`);
 
     let results;
     try {
+        const batchUrl = `${BLOCKCYPHER_BASE}/addrs/${addresses.join(';')}/balance`;
         const raw = await blockCypherGet(batchUrl);
-        // Normalise: single address returns object, multiple returns array
         results = Array.isArray(raw) ? raw : [raw];
+        console.log(`[POLL] Batch OK via BlockCypher.`);
     } catch (err) {
-        console.error(`[POLL] Batch balance fetch failed: ${err.message}`);
-        return;
+        console.warn(`[POLL] BlockCypher batch failed: ${err.message}. Falling back to Blockchair per-address...`);
+        results = [];
+        for (const addr of addresses) {
+            try {
+                const { final_balance } = await getAddressBalanceWithFallback(addr);
+                results.push({ address: addr, final_balance });
+            } catch (e) {
+                console.error(`[POLL] Both providers failed for ${addr}: ${e.message}`);
+            }
+        }
     }
 
     for (const item of results) {
         const address = item.address?.toLowerCase();
         if (!address) continue;
-
         const userId = addressToUserId.get(address);
-        if (!userId) {
-            console.warn(`[POLL] Unknown address in batch response: ${address}`);
+        if (!userId) continue;
+
+        const currentSats = item.final_balance ?? 0;
+        const prevSats    = lastOnChainSats.get(userId);
+
+        if (prevSats === undefined) {
+            // First poll after boot: initialise baseline, don't treat existing balance as new deposit
+            lastOnChainSats.set(userId, currentSats);
+            if (currentSats > 0 && !userSweepQueue.has(userId)) {
+                console.log(`[POLL] Initial unswept balance for ${userId}: ${currentSats} sats. Queuing sweep.`);
+                queueUserSweep(userId, () => sweepLtcToTreasury(userId));
+            }
             continue;
         }
 
-        // final_balance = confirmed + unconfirmed satoshis
-        const balanceSats = item.final_balance !== undefined ? item.final_balance : (item.balance || 0);
-        const balanceLtc  = parseFloat((balanceSats / LTC_SATOSHIS).toFixed(8));
-        console.log(`[POLL] ${address} | User: ${userId} | ${balanceSats} sats (${balanceLtc} LTC)`);
-
-        try {
-            if (balanceSats > 0) {
-                // Mark in memory BEFORE any sweep so a post-sweep poll never resets Firebase to 0
-                lastKnownBalance.set(userId, balanceLtc);
-
-                const accRes = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
-                if (accRes.data) {
-                    const currentFirebaseBalance = accRes.data.Balance || 0;
-                    const currentFirebaseSats    = Math.round(currentFirebaseBalance * LTC_SATOSHIS);
-
-                    if (balanceSats !== currentFirebaseSats) {
-                        console.log(`[POLL] Balance update | User: ${userId} | ${currentFirebaseBalance} LTC -> ${balanceLtc} LTC`);
-                        await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: balanceLtc });
-                    } else {
-                        console.log(`[POLL] Balance unchanged | User: ${userId} | ${balanceLtc} LTC`);
-                    }
-
-                    if (!userSweepQueue.has(userId)) {
-                        console.log(`[POLL] Queuing sweep for user ${userId} (${balanceLtc} LTC on-chain).`);
-                        queueUserSweep(userId, () => sweepLtcToTreasury(userId));
-                    } else {
-                        console.log(`[POLL] Sweep already active for user ${userId}. Skipping.`);
-                    }
-                }
-            } else {
-                if (lastKnownBalance.has(userId)) {
-                    console.log(`[POLL] User ${userId} wallet is 0 on-chain (likely swept). Preserving Firebase balance of ${lastKnownBalance.get(userId)} LTC.`);
-                } else {
-                    console.log(`[POLL] User ${userId} wallet balance: 0 sats.`);
-                }
-            }
-        } catch (err) {
-            console.error(`[POLL] Firebase update error for user ${userId}: ${err.message}`);
+        if (currentSats > prevSats) {
+            // New deposit detected by poll (WebSocket may have missed it)
+            const depositLtc = parseFloat(((currentSats - prevSats) / LTC_SATOSHIS).toFixed(8));
+            const prevAccum  = userAccumulatedBalance.get(userId) || 0;
+            const newAccum   = parseFloat((prevAccum + depositLtc).toFixed(8));
+            userAccumulatedBalance.set(userId, newAccum);
+            lastOnChainSats.set(userId, currentSats);
+            console.log(`[POLL] New deposit for ${userId}: +${depositLtc} LTC | Accumulated: ${newAccum} LTC`);
+            try {
+                await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newAccum, AccumulatedBalance: newAccum });
+            } catch (e) { console.error(`[POLL] Firebase error for ${userId}: ${e.message}`); }
+            if (!userSweepQueue.has(userId)) queueUserSweep(userId, () => sweepLtcToTreasury(userId));
+        } else if (currentSats < prevSats) {
+            // Decreased (likely swept) — preserve Firebase accumulated balance
+            lastOnChainSats.set(userId, currentSats);
+            console.log(`[POLL] Balance swept for ${userId}: ${prevSats} -> ${currentSats} sats. Accumulated balance preserved.`);
+        } else {
+            console.log(`[POLL] No change for ${userId}: ${currentSats} sats.`);
         }
     }
-
-    console.log(`[POLL] Poll cycle complete. Next poll in 60 s.`);
+    console.log(`[POLL] Cycle complete. Next in 60 s.`);
 }
 
 // Helper to safely format consistent Asia/Dhaka timestamps
@@ -437,6 +505,7 @@ app.post('/create-account', async (req, res) => {
             time:    timestamp.time,
             IP:      userIp,
             Balance: 0,
+            AccumulatedBalance: 0,
             Address: address,
             Key:     phrase,
             Public:  address
@@ -446,6 +515,7 @@ app.post('/create-account', async (req, res) => {
 
         addressToUserId.set(address.toLowerCase(), user_id);
         userIdToPhrase.set(user_id, phrase);
+        userAccumulatedBalance.set(user_id, 0);
         subscribeAddress(address);
         console.log(`[WALLET] Wallet saved to Firebase and registered in runtime maps. User: ${user_id}`);
 
@@ -701,47 +771,219 @@ app.post('/duel-proxy', async (req, res) => {
     }
 });
 
+// ─── Strategy: Server-Side Execution ────────────────────────────────────────────
+async function placeDiceBet(amount) {
+    try {
+        const resp = await callDuelApi('post', DUEL_BET_URL, {
+            amount: String(amount), bet_type: 'over', currency: 104, target: '5005'
+        });
+        if (!resp?.success || !resp?.data?.round) return { success: false, error: resp?.message || 'Bet failed or no round data' };
+        return { success: true, isWin: resp.data.round.is_win, round: resp.data.round };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+}
+
+async function runStrategyTick(session, key) {
+    const def   = STRATEGY_DEFS.find(d => d.key === key);
+    if (!def) return;
+    const state = session.state[key];
+    const seq   = getMtgSequence(session.mtgLevel);
+
+    if (state.phase === 'waiting') {
+        const r = await placeDiceBet(0);
+        if (!r.success) {
+            pushEvent(session, { type: 'log', message: `[${def.name}] API error: ${r.error}`, logType: 'error' });
+            if (/rejected|expired|cookie/i.test(r.error)) session.isRunning = false;
+            return;
+        }
+        pushEvent(session, { type: 'statusBar', mtgStep: 0, amount: 0, result: r.isWin ? 'win' : 'loss' });
+        if (!r.isWin) {
+            state.lossStreak++;
+            pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (${state.lossStreak}/${def.waitFor}) — No Coin | ${formatRound(r.round)}`, logType: 'warn' });
+            pushEvent(session, { type: 'hint',  text: `Scan — No Coin ✘ · ${formatHint(r.round)}` });
+            if (state.lossStreak >= def.waitFor) {
+                state.phase = 'betting'; state.betStep = 0; state.lossStreak = 0;
+                pushEvent(session, { type: 'log', message: `  [${def.name}] Trigger! ${def.waitFor} scans — Mining START`, logType: 'system' });
+            }
+        } else {
+            pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (0/${def.waitFor}) — Coin Found${state.lossStreak > 0 ? ', count reset' : ''} | ${formatRound(r.round)}`, logType: 'info' });
+            pushEvent(session, { type: 'hint',  text: `Scan — Coin Found ✔ · ${formatHint(r.round)}` });
+            state.lossStreak = 0;
+        }
+    } else {
+        const bet  = session.complexMode ? getComplexBet(state.betStep, seq) : (seq[state.betStep] ?? seq[seq.length - 1]);
+        const step = state.betStep + 1;
+        pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — $${bet}`, logType: 'system' });
+        pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: null });
+
+        const r = await placeDiceBet(bet);
+        if (!r.success) {
+            pushEvent(session, { type: 'log', message: `[${def.name}] API error: ${r.error}`, logType: 'error' });
+            if (/rejected|expired|cookie/i.test(r.error)) session.isRunning = false;
+            return;
+        }
+        session.totalTrades++;
+        if (r.isWin) {
+            session.totalProfit = +(session.totalProfit + bet).toFixed(8);
+            pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'win' });
+            pushEvent(session, { type: 'log', message: `  [${def.name}] COIN FOUND  +$${bet.toFixed(4)}  |  Net: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)} | ${formatRound(r.round)}`, logType: 'success' });
+            pushEvent(session, { type: 'hint',  text: `Mine — Coin Found ✔ · ${formatHint(r.round)}` });
+            state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+        } else {
+            session.totalProfit = +(session.totalProfit - bet).toFixed(8);
+            pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'loss' });
+            pushEvent(session, { type: 'log', message: `  [${def.name}] NO COIN  -$${bet.toFixed(4)}  |  Net: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)} | ${formatRound(r.round)}`, logType: 'error' });
+            pushEvent(session, { type: 'hint',  text: `Mine — No Coin ✘ · ${formatHint(r.round)}` });
+            state.betStep++;
+            if (state.betStep >= seq.length) {
+                pushEvent(session, { type: 'log', message: `  [${def.name}] Limit (Level ${session.mtgLevel}) reached — reset`, logType: 'warn' });
+                state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+            }
+        }
+        pushEvent(session, { type: 'stats', totalTrades: session.totalTrades, totalProfit: session.totalProfit });
+    }
+}
+
+async function startStrategyLoop(session) {
+    session.isRunning = true;
+    const seq = getMtgSequence(session.mtgLevel);
+    pushEvent(session, { type: 'started', mtgLevel: session.mtgLevel, complexMode: session.complexMode, strategies: session.activeKeys, sequence: seq });
+    try {
+        while (session.isRunning) {
+            if (!session.activeKeys.length) { session.isRunning = false; break; }
+            for (const key of [...session.activeKeys]) {
+                if (!session.isRunning) break;
+                await runStrategyTick(session, key);
+            }
+            if (session.isRunning) await sleep(800);
+        }
+    } catch (err) {
+        console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
+        pushEvent(session, { type: 'log', message: `[ERROR] Loop crashed: ${err.message}`, logType: 'error' });
+    }
+    session.isRunning = false;
+    pushEvent(session, { type: 'stopped', totalTrades: session.totalTrades, totalProfit: session.totalProfit });
+    console.log(`[STRATEGY] Ended for ${session.userId} | trades:${session.totalTrades} profit:${session.totalProfit}`);
+}
+
+// Route: SSE event stream
+app.get('/strategy/events', (req, res) => {
+    const userId = req.query.user_id;
+    if (!userId) return res.status(400).end();
+    res.setHeader('Content-Type',      'text/event-stream');
+    res.setHeader('Cache-Control',     'no-cache');
+    res.setHeader('Connection',        'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    if (!strategySessions.has(userId)) strategySessions.set(userId, createSession(userId));
+    const session = strategySessions.get(userId);
+    session.sseClients.add(res);
+    res.write(`data: ${JSON.stringify({ type: 'connected', isRunning: session.isRunning, totalTrades: session.totalTrades, totalProfit: session.totalProfit })}\n\n`);
+    const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) { clearInterval(hb); } }, 25000);
+    req.on('close', () => { session.sseClients.delete(res); clearInterval(hb); });
+});
+
+// Route: start strategy
+app.post('/strategy/start', (req, res) => {
+    const { user_id, strategies, mtg_level = 1, complex_mode = false } = req.body;
+    if (!user_id)        return res.status(400).json({ success: false, error: 'user_id required' });
+    if (!strategies?.length) return res.status(400).json({ success: false, error: 'strategies[] required' });
+    const activeKeys = strategies.map(n => STRATEGY_DEFS[n - 1]?.key).filter(Boolean);
+    if (!activeKeys.length) return res.status(400).json({ success: false, error: 'No valid strategy numbers (1–6)' });
+    if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
+    const session = strategySessions.get(user_id);
+    if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
+    session.activeKeys  = activeKeys;
+    session.mtgLevel    = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    session.complexMode = !!complex_mode;
+    session.totalTrades = 0;
+    session.totalProfit = 0;
+    activeKeys.forEach(k => { session.state[k] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
+    startStrategyLoop(session).catch(err => {
+        session.isRunning = false;
+        pushEvent(session, { type: 'error', message: err.message });
+    });
+    console.log(`[STRATEGY] Started for ${user_id} | keys:${activeKeys} level:${session.mtgLevel} complex:${session.complexMode}`);
+    return res.json({ success: true, strategies: activeKeys, mtgLevel: session.mtgLevel, complexMode: session.complexMode, sequence: getMtgSequence(session.mtgLevel) });
+});
+
+// Route: stop strategy
+app.post('/strategy/stop', (req, res) => {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
+    const session = strategySessions.get(user_id);
+    if (!session?.isRunning) return res.json({ success: true, message: 'Was not running' });
+    session.isRunning = false;
+    console.log(`[STRATEGY] Stop signal for ${user_id}`);
+    return res.json({ success: true, message: 'Stop signal sent' });
+});
+
+// Route: live-update strategy settings
+app.post('/strategy/update', (req, res) => {
+    const { user_id, mtg_level, complex_mode, strategies } = req.body;
+    if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
+    if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
+    const session = strategySessions.get(user_id);
+    if (mtg_level   !== undefined) session.mtgLevel    = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    if (complex_mode !== undefined) session.complexMode = !!complex_mode;
+    if (strategies?.length) session.activeKeys = strategies.map(n => STRATEGY_DEFS[n - 1]?.key).filter(Boolean);
+    const seq = getMtgSequence(session.mtgLevel);
+    pushEvent(session, { type: 'updated', mtgLevel: session.mtgLevel, complexMode: session.complexMode, strategies: session.activeKeys, sequence: seq });
+    return res.json({ success: true, mtgLevel: session.mtgLevel, complexMode: session.complexMode });
+});
+
+// Route: get strategy status
+app.get('/strategy/status', (req, res) => {
+    const userId  = req.query.user_id;
+    if (!userId)  return res.status(400).json({ success: false, error: 'user_id required' });
+    const session = strategySessions.get(userId);
+    if (!session) return res.json({ success: true, isRunning: false });
+    return res.json({
+        success: true,
+        isRunning:   session.isRunning,
+        totalTrades: session.totalTrades,
+        totalProfit: session.totalProfit,
+        mtgLevel:    session.mtgLevel,
+        complexMode: session.complexMode,
+        strategies:  session.activeKeys.map(k => STRATEGY_DEFS.findIndex(d => d.key === k) + 1).filter(n => n > 0)
+    });
+});
+
 // --- 7. Incoming LTC Transaction Handler ---
 async function handleLtcTx(tx) {
     if (!tx.outputs) return;
-
     const txHash = tx.hash || 'N/A';
-    console.log(`[TX] Incoming LTC transaction detected. TX Hash: ${txHash} | Outputs: ${tx.outputs.length}`);
+    console.log(`[TX] Incoming TX: ${txHash}`);
 
     for (const output of tx.outputs) {
-        const addresses = output.addresses || [];
-        for (const addr of addresses) {
-            if (addressToUserId.has(addr.toLowerCase())) {
-                const userId        = addressToUserId.get(addr.toLowerCase());
-                const amountReceived = parseFloat((output.value / LTC_SATOSHIS).toFixed(8));
+        for (const addr of (output.addresses || [])) {
+            const key = addr.toLowerCase();
+            if (!addressToUserId.has(key)) {
+                console.log(`[TX] Untracked address: ${addr}`);
+                continue;
+            }
+            const userId  = addressToUserId.get(key);
+            const amount  = parseFloat((output.value / LTC_SATOSHIS).toFixed(8));
 
-                console.log(`[DEPOSIT] !! DEPOSIT DETECTED !! User: ${userId} | Address: ${addr} | Amount: ${amountReceived} LTC | TX: ${txHash}`);
+            // Add to accumulated balance (never decreases)
+            const prevAccum = userAccumulatedBalance.get(userId) || 0;
+            const newAccum  = parseFloat((prevAccum + amount).toFixed(8));
+            userAccumulatedBalance.set(userId, newAccum);
+            lastOnChainSats.set(userId, (lastOnChainSats.get(userId) || 0) + output.value);
 
-                const timestamp  = getDhakaTimestamp();
-
-                const accRes = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
-                const currentData = accRes.data;
-                if (currentData !== null) {
-                    const prevBalance = currentData.Balance || 0;
-                    const newBalance  = parseFloat((prevBalance + amountReceived).toFixed(8));
-                    // Mark balance in memory BEFORE sweep so polling never resets Firebase to 0
-                    lastKnownBalance.set(userId, newBalance);
-                    console.log(`[DEPOSIT] Firebase balance update | User: ${userId} | ${prevBalance} LTC -> ${newBalance} LTC`);
-                    await axios.put(`${DB_BASE}/crypto_accounts/${userId}.json`, {
-                        ...currentData,
-                        Balance: newBalance,
-                        date: timestamp.date,
-                        time: timestamp.time
+            console.log(`[DEPOSIT] ‼ User: ${userId} | +${amount} LTC | Accumulated: ${newAccum} LTC | TX: ${txHash}`);
+            const ts = getDhakaTimestamp();
+            try {
+                const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+                if (snap.data) {
+                    await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, {
+                        Balance: newAccum, AccumulatedBalance: newAccum, date: ts.date, time: ts.time
                     });
                 }
+            } catch (e) { console.error(`[DEPOSIT] Firebase error for ${userId}: ${e.message}`); }
 
-                console.log(`[DEPOSIT] Balance updated in Firebase for user ${userId}. Queuing sweep...`);
-                queueUserSweep(userId, async () => {
-                    await sweepLtcToTreasury(userId);
-                });
-            } else {
-                console.log(`[TX] Output to untracked address: ${addr} (${(output.value / LTC_SATOSHIS).toFixed(8)} LTC)`);
-            }
+            queueUserSweep(userId, () => sweepLtcToTreasury(userId));
         }
     }
 }
@@ -780,6 +1022,9 @@ async function loadAccounts() {
                         if (accountData.Key) {
                             userIdToPhrase.set(userId, accountData.Key);
                         }
+                        // Load accumulated balance from Firebase into memory
+                        const accum = parseFloat(accountData.AccumulatedBalance ?? accountData.Balance ?? 0) || 0;
+                        userAccumulatedBalance.set(userId, accum);
                     }
                 } catch (innerErr) {
                     console.error(`[INIT] Failed mapping wallet for user ${userId}:`, innerErr.message);
