@@ -48,12 +48,11 @@ const userSweepQueue  = new Map();
 const lastKnownBalance = new Map();
 
 // --- Duel token in-memory state ---
-// Pre-seeded with the current known valid token.
-// callDuelApi always uses this — client-supplied tokens are never accepted.
-// On security_token_required the token is auto-refreshed via fetchDuelToken().
-let duelToken          = "ZQzOpl94tyKDLnlp5PoEJneonmU3IJ6ckpnW/K6O+gA+";
-let duelTokenExpiresAt = Date.now() + 10 * 60 * 1000; // treat as valid for 10 min from boot
-let duelTokenRefreshing = null;  // in-flight refresh Promise (mutex to prevent concurrent re-fetches)
+// Always fetched fresh on boot — never trust a hardcoded token as Duel tokens expire in 600 s.
+// callDuelApi always uses the server-managed token; client-supplied tokens are ignored.
+let duelToken           = null;
+let duelTokenExpiresAt  = 0;
+let duelTokenRefreshing = null; // mutex: prevents concurrent refresh requests
 
 // Active WebSocket state
 let wsClient        = null;
@@ -462,10 +461,10 @@ async function getValidDuelToken() {
     return fetchDuelToken();
 }
 
-// Makes a Duel API call with the current token.
-// The token is sent BOTH as the x-security-token header AND merged into the
-// request body as "security_token" — Duel requires it in the body.
-// If the response contains security_token_required, fetches a new token and retries once.
+// Makes a Duel API call with the server-managed token.
+// Token is injected into BOTH the x-security-token header AND the request body.
+// On security_token_required (in body OR in an HTTP 4xx response) the token is
+// invalidated, a fresh one is fetched, and the call is retried exactly once.
 async function callDuelApi(method, url, payload, extraHeaders = {}) {
     const makeRequest = async (token) => {
         const headers = {
@@ -481,45 +480,102 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
             'x-security-token':         token,
             ...extraHeaders
         };
-
-        // Merge security_token into the body — Duel checks the body, not just the header
+        // Duel requires the token in the request body too
         const bodyWithToken = payload ? { ...payload, security_token: token } : { security_token: token };
 
-        const result = await axios({ method, url, data: bodyWithToken, headers });
-        return result.data;
+        console.log(`[DUEL-API] ${method.toUpperCase()} ${url} | token: ${token.substring(0, 12)}...`);
+
+        try {
+            const result = await axios({ method, url, data: bodyWithToken, headers });
+            return result.data;
+        } catch (axiosErr) {
+            const status  = axiosErr.response?.status;
+            const errBody = axiosErr.response?.data;
+            console.error(`[DUEL-API] HTTP ${status ?? 'N/A'} from Duel | URL: ${url} | Body: ${JSON.stringify(errBody ?? axiosErr.message)}`);
+            // Duel sometimes returns security_token_required inside a 4xx body.
+            // Return the body so the retry logic below can catch it instead of hard-throwing.
+            if (errBody && errBody.security_token_required) {
+                console.warn(`[DUEL-API] security_token_required detected in HTTP ${status} error body. Will refresh token.`);
+                return errBody;
+            }
+            throw axiosErr;
+        }
     };
 
     let token = await getValidDuelToken();
     let body  = await makeRequest(token);
 
-    // Detect token rejection: refresh once and retry
+    // ---- Token rejection: refresh + single retry ----
     if (body && body.security_token_required) {
-        console.warn("[TOKEN] security_token_required — invalidating cached token, refreshing and retrying...");
-        duelToken = null; // force re-fetch (bypass expiry check)
-        token = await fetchDuelToken();
-        body  = await makeRequest(token);
-
-        // If it STILL fails after a fresh token, throw so the caller gets a proper error
-        if (body && body.security_token_required) {
-            console.error("[TOKEN] Still getting security_token_required after refresh. Cookies may be expired.");
-            throw new Error("Duel security token rejected even after refresh — cookies may be expired");
+        console.warn(`[DUEL-API] security_token_required in response body. Invalidating cached token and refreshing...`);
+        duelToken = null; // force re-fetch on next getValidDuelToken call
+        try {
+            token = await fetchDuelToken();
+        } catch (refreshErr) {
+            console.error(`[DUEL-API] Token refresh failed: ${refreshErr.message}. Duel cookies may be expired — update DUEL_COOKIES.`);
+            throw new Error(`Token refresh failed: ${refreshErr.message}`);
         }
+        console.log(`[DUEL-API] Retrying with fresh token: ${token.substring(0, 12)}...`);
+        body = await makeRequest(token);
+
+        if (body && body.security_token_required) {
+            console.error(`[DUEL-API] security_token_required STILL present after refresh. Cookies are likely expired. Update DUEL_COOKIES in the server config.`);
+            throw new Error('Duel security token rejected after refresh — DUEL_COOKIES may be expired');
+        }
+    }
+
+    if (body && body.success === false) {
+        console.warn(`[DUEL-API] Duel returned success:false | URL: ${url} | ${JSON.stringify(body)}`);
     }
 
     return body;
 }
 
-// Route: expose current token to callers
+// Route: expose current server-managed token (for debugging / client-side use)
 app.get('/next_token', async (req, res) => {
     try {
         const token = await getValidDuelToken();
+        console.log(`[TOKEN] /next_token served | token: ${token.substring(0, 12)}... | expires: ${new Date(duelTokenExpiresAt).toISOString()}`);
         return res.json({
             token,
             expires_at: new Date(duelTokenExpiresAt).toISOString()
         });
     } catch (error) {
-        console.error("[TOKEN] Error in /next_token route:", error.message);
-        return res.status(500).json({ error: "Token fetch failed", detail: error.message });
+        console.error(`[TOKEN] /next_token failed: ${error.message}`);
+        return res.status(500).json({ error: 'Token fetch failed', detail: error.message });
+    }
+});
+
+// Route: Generic Duel.com API Proxy
+// Client sends: POST /duel-proxy  { "path": "/api/v2/games/dice", "method": "post", "payload": { ... } }
+// Server injects the managed security token and forwards the request to duel.com.
+// Returns: { success, duel_response } — token errors are handled transparently server-side.
+app.post('/duel-proxy', async (req, res) => {
+    const { path, method = 'post', payload } = req.body;
+
+    if (!path || typeof path !== 'string' || !path.startsWith('/')) {
+        console.warn(`[DUEL-PROXY] Bad request — missing or invalid 'path': ${JSON.stringify(req.body)}`);
+        return res.status(400).json({ success: false, error: "'path' is required and must start with '/'" });
+    }
+
+    const url = `https://duel.com${path}`;
+    console.log(`[DUEL-PROXY] ${method.toUpperCase()} ${url} | payload: ${JSON.stringify(payload ?? {})}`);
+
+    try {
+        const duelResponse = await callDuelApi(method, url, payload);
+        const outerSuccess = duelResponse?.success !== false;
+        if (!outerSuccess) {
+            console.warn(`[DUEL-PROXY] Duel returned success:false | path: ${path} | ${JSON.stringify(duelResponse)}`);
+        } else {
+            console.log(`[DUEL-PROXY] OK | path: ${path}`);
+        }
+        return res.json({ success: outerSuccess, duel_response: duelResponse });
+    } catch (error) {
+        console.error(`[DUEL-PROXY] Error | path: ${path} | ${error.message}`);
+        if (error.response) {
+            console.error(`[DUEL-PROXY] Duel HTTP response:`, JSON.stringify(error.response.data));
+        }
+        return res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -622,12 +678,12 @@ loadAccounts().then(() => {
     console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
     connectBlockchain();
 
-    // Ensure Duel token is ready; if pre-seeded token is still valid this is a no-op.
-    // Auto-refresh fires every 590 s to keep the token alive proactively.
-    console.log("[BOOT] Verifying Duel security token...");
-    getValidDuelToken()
-        .then(t => console.log(`[BOOT] Duel token ready: ${t.substring(0, 10)}...`))
-        .catch(err => console.error("[BOOT] Initial Duel token check failed:", err.message));
+    // Fetch a fresh Duel token on every boot — never rely on a cached/hardcoded value.
+    // Auto-refresh fires every 590 s to stay ahead of the 600 s expiry.
+    console.log("[BOOT] Fetching fresh Duel security token...");
+    fetchDuelToken()
+        .then(t => console.log(`[BOOT] Duel token ready: ${t.substring(0, 12)}... | expires: ${new Date(duelTokenExpiresAt).toISOString()}`))
+        .catch(err => console.error(`[BOOT] Duel token fetch FAILED: ${err.message} — Update DUEL_COOKIES if cookies are expired`));
     setInterval(() => {
         console.log("[TOKEN] Auto-refresh: fetching new Duel security token...");
         fetchDuelToken().catch(err => console.error("[TOKEN] Auto-refresh failed:", err.message));
