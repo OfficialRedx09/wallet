@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const admin = require('firebase-admin');
 const bitcoin = require('bitcoinjs-lib');
 const { BIP32Factory } = require('bip32');
 const bip39 = require('bip39');
@@ -8,13 +7,8 @@ const ecc = require('tiny-secp256k1');
 const axios = require('axios');
 const WebSocket = require('ws');
 
-// --- 1. Firebase Initialization ---
-const serviceAccount = require('./serviceAccountKey.json');
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://marketwave-727e8-default-rtdb.firebaseio.com"
-});
-const db = admin.database();
+// --- 1. Firebase Realtime Database (Public REST API) ---
+const DB_BASE = "https://marketwave-727e8-default-rtdb.firebaseio.com";
 
 const app = express();
 app.use(cors());
@@ -215,7 +209,7 @@ async function sweepLtcToTreasury(userId) {
         console.log(`[SWEEP] Broadcast successful! TX Hash: ${txHash}`);
 
         const confirmedAmount = parseFloat((sendSatoshis / LTC_SATOSHIS).toFixed(8));
-        await db.ref(`wallet_conformation/${userId}`).set(confirmedAmount);
+        await axios.put(`${DB_BASE}/wallet_conformation/${userId}.json`, confirmedAmount);
         console.log(`[SWEEP] Firebase updated. wallet_conformation/${userId} = ${confirmedAmount} LTC`);
 
         console.log(`[SWEEP] ✔ SUCCESS: ${confirmedAmount} LTC swept to Treasury for user ${userId} | TX: ${txHash}`);
@@ -253,9 +247,8 @@ app.post('/create-account', async (req, res) => {
             return res.status(400).json({ error: "user_id parameter is required" });
         }
 
-        const accountRef       = db.ref(`crypto_accounts/${user_id}`);
-        const existingSnapshot = await accountRef.once('value');
-        const existingAccount  = existingSnapshot.val();
+        const existingSnapshot = await axios.get(`${DB_BASE}/crypto_accounts/${user_id}.json`);
+        const existingAccount  = existingSnapshot.data;
 
         if (existingAccount) {
             let existingAddress = "";
@@ -304,7 +297,7 @@ app.post('/create-account', async (req, res) => {
             Public:  address
         };
 
-        await accountRef.set(newAccountData);
+        await axios.put(`${DB_BASE}/crypto_accounts/${user_id}.json`, newAccountData);
 
         addressToUserId.set(address.toLowerCase(), user_id);
         userIdToPhrase.set(user_id, phrase);
@@ -340,20 +333,20 @@ async function handleLtcTx(tx) {
                 console.log(`[DEPOSIT] !! DEPOSIT DETECTED !! User: ${userId} | Address: ${addr} | Amount: ${amountReceived} LTC | TX: ${txHash}`);
 
                 const timestamp  = getDhakaTimestamp();
-                const accountRef = db.ref(`crypto_accounts/${userId}`);
 
-                await accountRef.transaction((currentData) => {
-                    if (currentData === null) return currentData; // account must exist
+                const accRes = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+                const currentData = accRes.data;
+                if (currentData !== null) {
                     const prevBalance = currentData.Balance || 0;
                     const newBalance  = parseFloat((prevBalance + amountReceived).toFixed(8));
                     console.log(`[DEPOSIT] Firebase balance update | User: ${userId} | ${prevBalance} LTC -> ${newBalance} LTC`);
-                    return {
+                    await axios.put(`${DB_BASE}/crypto_accounts/${userId}.json`, {
                         ...currentData,
                         Balance: newBalance,
                         date: timestamp.date,
                         time: timestamp.time
-                    };
-                });
+                    });
+                }
 
                 console.log(`[DEPOSIT] Balance updated in Firebase for user ${userId}. Queuing sweep...`);
                 queueUserSweep(userId, async () => {
@@ -370,8 +363,8 @@ async function handleLtcTx(tx) {
 async function loadAccounts() {
     console.log("[INIT] Loading accounts from Firebase...");
     try {
-        const snapshot = await db.ref('crypto_accounts').once('value');
-        const accounts = snapshot.val();
+        const response = await axios.get(`${DB_BASE}/crypto_accounts.json`);
+        const accounts = response.data;
 
         if (accounts) {
             const total = Object.keys(accounts).length;
