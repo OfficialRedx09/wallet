@@ -33,6 +33,11 @@ const LITECOIN_NETWORK = {
     wif: 0xb0
 };
 
+// --- Duel.com Token Config ---
+const DUEL_TOKEN_URL    = "https://duel.com/api/v2/user/security/token";
+const DUEL_DEVICE_UUID  = process.env.DUEL_DEVICE_UUID  || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
+const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "duel=ZetFwwIEJuC2L6kZNiAYQyQwnc9CyfgErVtqcwWA; do_not_share_this_with_anyone_not_even_staff=4975939_l09WQ6ZeqD8HWQDGnBi4PbGavFTvhDwX7tB7A8jAlYrrldcNPEglAW2Gw3Ik; cf_clearance=fOrtE9TNoPnxCGxIeGJfHvuKPt8i2hlZTQa_vJWPmVM-1780691376-1.2.1.1-D3IhI9XEARs0VQLjhRsLPZV9uja2Jm08LF0v3Uvx1S0VaDcMCqXPrPSTEq254BnP0ZPRYsij5U6IfRYATZJjBrDaGn2eebjVfd6DraH_1hTgb7ET6FllTn6sFxQTjLatfItEc5UJithCLExCEg4IqyrzI1IZz01RSTgrH_a9zxtR9krqAQa5ko6nnjrSVV7piek8DBE2Wp_GqlgeJAsNgQgZbXKa8FIzJcBDmyVPI2HbqiAq.7B1y9jpINCOfxT7TH5iKKKoYRfR_FM64dVeiUjy9lgcQI9FfqqhelFT08zg5kB0lZlMFY7NUzIIc2UjRfOdXkzyQvznVJwYVjYa_xVno1S7O3R461G8sqQbW7Mn5UOs4WjtSinpeAF9kuM17_IOa35EQKs0aeH33w.7ey4K.4Hyd0A4xH4jzUe8O2I; __cf_bm=FNLnCI9P79KFmVcTQyLoAjsBpWvKnvUNPfQs.H77qxg-1780691628-1.0.1.1-rHIX5QdVfL7BfMziRanBrZtuRBdkJkaXE8RG8nlYceghtUj1_AmlrlKFkQkF8ahVr36ldmgpSEpQLpQ9r14YC5ZGVv_36Yfs7B2YN.XXqhw; env_class=blue";
+
 // Core Lookup Maps
 const addressToUserId = new Map();
 const userIdToPhrase  = new Map();
@@ -41,6 +46,10 @@ const userSweepQueue  = new Map();
 // Server-side balance memory: stores last known non-zero balance per userId
 // This prevents a post-sweep poll from overwriting Firebase Balance back to 0
 const lastKnownBalance = new Map();
+
+// --- Duel token in-memory state ---
+let duelToken          = null;   // current valid token string
+let duelTokenExpiresAt = 0;      // unix ms when token expires
 
 // Active WebSocket state
 let wsClient        = null;
@@ -383,7 +392,107 @@ app.post('/create-account', async (req, res) => {
     }
 });
 
-// --- 6. Incoming LTC Transaction Handler ---
+// --- 6. Route: Get Duel Security Token ---
+
+// Internal: fetch a fresh token from Duel and store it in memory
+async function fetchDuelToken() {
+    console.log("[TOKEN] Fetching fresh Duel security token...");
+    const response = await axios.post(
+        DUEL_TOKEN_URL,
+        { uuid: DUEL_DEVICE_UUID, code: "0000", type: "standard" },
+        {
+            headers: {
+                'accept':                    'application/json, text/plain, */*',
+                'accept-language':           'en-GB,en;q=0.6',
+                'content-type':              'application/json',
+                'cookie':                    DUEL_COOKIES,
+                'origin':                    'https://duel.com',
+                'priority':                  'u=1, i',
+                'referer':                   'https://duel.com/dice',
+                'sec-ch-ua':                 '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-mobile':          '?1',
+                'sec-ch-ua-platform':        '"iOS"',
+                'sec-fetch-dest':            'empty',
+                'sec-fetch-mode':            'cors',
+                'sec-fetch-site':            'same-origin',
+                'sec-gpc':                   '1',
+                'user-agent':                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+                'x-duel-device-identifier':  DUEL_DEVICE_UUID,
+                'x-env-class':               'blue'
+            }
+        }
+    );
+
+    const body = response.data;
+    if (!body || !body.success || !body.token) {
+        throw new Error(`Duel token API returned non-success: ${JSON.stringify(body)}`);
+    }
+
+    const expiresIn = body.expires_in || 600; // seconds
+    duelToken          = body.token;
+    duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000; // subtract 10 s buffer
+    console.log(`[TOKEN] Token stored. Valid for ~${expiresIn}s (refreshes at ${new Date(duelTokenExpiresAt).toISOString()})`);
+    return duelToken;
+}
+
+// Returns a valid token from memory, fetching a new one only if expired
+async function getValidDuelToken() {
+    if (duelToken && Date.now() < duelTokenExpiresAt) {
+        return duelToken;
+    }
+    console.log("[TOKEN] Token missing or expired. Fetching new token...");
+    return fetchDuelToken();
+}
+
+// Makes a Duel API call with the current token.
+// If the response contains security_token_required, fetches a new token and retries once.
+async function callDuelApi(method, url, payload, extraHeaders = {}) {
+    const token = await getValidDuelToken();
+    const headers = {
+        'accept':                   'application/json, text/plain, */*',
+        'accept-language':          'en-GB,en;q=0.6',
+        'content-type':             'application/json',
+        'cookie':                   DUEL_COOKIES,
+        'origin':                   'https://duel.com',
+        'referer':                  'https://duel.com/dice',
+        'user-agent':               'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+        'x-duel-device-identifier': DUEL_DEVICE_UUID,
+        'x-env-class':              'blue',
+        'x-security-token':         token,
+        ...extraHeaders
+    };
+
+    let result = await axios({ method, url, data: payload, headers });
+    let body = result.data;
+
+    // Detect token rejection and retry once with a fresh token
+    if (body && body.security_token_required) {
+        console.warn("[TOKEN] security_token_required received — refreshing token and retrying...");
+        duelToken = null; // force re-fetch
+        const newToken = await fetchDuelToken();
+        headers['x-security-token'] = newToken;
+        result = await axios({ method, url, data: payload, headers });
+        body = result.data;
+    }
+
+    return body;
+}
+
+// Route: expose current token to callers
+app.get('/next_token', async (req, res) => {
+    try {
+        const token = await getValidDuelToken();
+        return res.json({
+            token,
+            expires_at: new Date(duelTokenExpiresAt).toISOString()
+        });
+    } catch (error) {
+        console.error("[TOKEN] Error in /next_token route:", error.message);
+        return res.status(500).json({ error: "Token fetch failed", detail: error.message });
+    }
+});
+
+// --- 7. Incoming LTC Transaction Handler ---
 async function handleLtcTx(tx) {
     if (!tx.outputs) return;
 
@@ -481,6 +590,14 @@ console.log("[BOOT] Marketwave LTC Server starting...");
 loadAccounts().then(() => {
     console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
     connectBlockchain();
+
+    // Pre-fetch Duel token on boot, then auto-refresh every 590 s (10 s before expiry)
+    console.log("[BOOT] Pre-fetching Duel security token...");
+    fetchDuelToken().catch(err => console.error("[BOOT] Initial Duel token fetch failed:", err.message));
+    setInterval(() => {
+        console.log("[TOKEN] Auto-refresh: fetching new Duel security token...");
+        fetchDuelToken().catch(err => console.error("[TOKEN] Auto-refresh failed:", err.message));
+    }, 590 * 1000);
 
     // Start continuous balance polling: immediately on boot, then every 2 minutes
     console.log("[BOOT] Starting periodic balance polling (every 2 minutes)...");
