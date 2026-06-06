@@ -60,7 +60,7 @@ const DUEL_TOKEN_URL    = "https://duel.com/api/v2/user/security/token";
 const DUEL_BET_URL      = "https://duel.com/api/v2/dice/bet";
 const BLOCKCHAIR_BASE   = "https://api.blockchair.com/litecoin";
 const DUEL_DEVICE_UUID  = process.env.DUEL_DEVICE_UUID  || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
-const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "duel=ZetFwwIEJuC2L6kZNiAYQyQwnc9CyfgErVtqcwWA; do_not_share_this_with_anyone_not_even_staff=4975939_l09WQ6ZeqD8HWQDGnBi4PbGavFTvhDwX7tB7A8jAlYrrldcNPEglAW2Gw3Ik; cf_clearance=fOrtE9TNoPnxCGxIeGJfHvuKPt8i2hlZTQa_vJWPmVM-1780691376-1.2.1.1-D3IhI9XEARs0VQLjhRsLPZV9uja2Jm08LF0v3Uvx1S0VaDcMCqXPrPSTEq254BnP0ZPRYsij5U6IfRYATZJjBrDaGn2eebjVfd6DraH_1hTgb7ET6FllTn6sFxQTjLatfItEc5UJithCLExCEg4IqyrzI1IZz01RSTgrH_a9zxtR9krqAQa5ko6nnjrSVV7piek8DBE2Wp_GqlgeJAsNgQgZbXKa8FIzJcBDmyVPI2HbqiAq.7B1y9jpINCOfxT7TH5iKKKoYRfR_FM64dVeiUjy9lgcQI9FfqqhelFT08zg5kB0lZlMFY7NUzIIc2UjRfOdXkzyQvznVJwYVjYa_xVno1S7O3R461G8sqQbW7Mn5UOs4WjtSinpeAF9kuM17_IOa35EQKs0aeH33w.7ey4K.4Hyd0A4xH4jzUe8O2I; _sp_id.d35b=c754ce38-2a8f-4af7-8e2a-f7eec01bcc1b.1780527197.14.1780697027.1780690862.db9e315d-f57e-4044-aeef-ed44a9ae1858.0a317223-81b0-49c2-8491-708259c73d2f.577ce2b2-7551-4493-9899-05dd0d02fafa.1780694274209.7; __cf_bm=dat5EqnwqubNMLrQmCEl2EgckQFhkdHqEGWR3faVHLI-1780697967.8603165-1.0.1.1-5lGbotWeCsQ037AderatEGXKIThjnLTVLetXNcz.HmrgLGrKTj94P80egiyDSEOXVK0jhZT2DavgcCmbhriDU5VMToiDOPfAHdDxkI6dVIzS_ceGhwOqiufR94oxl.Eo; env_class=blue";
+const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "duel=sCqw1cqvNng9J0A99iOrezQPK4c4LbZSpAEuNGrh; do_not_share_this_with_anyone_not_even_staff=4975939_HSz6LmrgSus3qCcGnjbCUueh4Qp55r93DAm4EaNwxy1lekZg2Sv2B5RE1gtM; cf_clearance=fOrtE9TNoPnxCGxIeGJfHvuKPt8i2hlZTQa_vJWPmVM-1780691376-1.2.1.1-D3IhI9XEARs0VQLjhRsLPZV9uja2Jm08LF0v3Uvx1S0VaDcMCqXPrPSTEq254BnP0ZPRYsij5U6IfRYATZJjBrDaGn2eebjVfd6DraH_1hTgb7ET6FllTn6sFxQTjLatfItEc5UJithCLExCEg4IqyrzI1IZz01RSTgrH_a9zxtR9krqAQa5ko6nnjrSVV7piek8DBE2Wp_GqlgeJAsNgQgZbXKa8FIzJcBDmyVPI2HbqiAq.7B1y9jpINCOfxT7TH5iKKKoYRfR_FM64dVeiUjy9lgcQI9FfqqhelFT08zg5kB0lZlMFY7NUzIIc2UjRfOdXkzyQvznVJwYVjYa_xVno1S7O3R461G8sqQbW7Mn5UOs4WjtSinpeAF9kuM17_IOa35EQKs0aeH33w.7ey4K.4Hyd0A4xH4jzUe8O2I; _sp_id.d35b=c754ce38-2a8f-4af7-8e2a-f7eec01bcc1b.1780527197.19.1780753397.1780724973.27892308-a6ae-4a31-a5fa-ef83209d5651.c7706afd-d1be-4530-b00b-62a92cd829d5.6eac7b4b-b899-4625-a40f-1b7974c5e2d8.1780753387392.5; __cf_bm=Xs6T_SQ.B9Ps0znoP8NHEFmE3x5tIuMqtyT.QyPDwxM-1780753394.9858382-1.0.1.1-PjXIEy.JmaTOQv6s5EgvuKRC0GVTflRhfVxr1AtDgaouzFOEOdCS3HNXjmpHojBADeNdDVjlKQ0JKklDheQhPv1PPzulIoip2tRJRC.TORGoJniTXlvuWz5.XTKIbBoT; env_class=blue";
 
 // Core Lookup Maps
 const addressToUserId        = new Map();
@@ -586,6 +586,11 @@ async function fetchDuelToken() {
 
                 const rawBody   = response.data; // string because responseType:'text'
                 const rawLength = Buffer.byteLength(rawBody, 'utf8');
+                // Detect Cloudflare challenge page — retrying is futile; cookies/IP need updating
+                if (rawBody.includes('cf_chl_opt') || rawBody.includes('cdn-cgi/challenge-platform') || rawBody.includes('Security check')) {
+                    console.error(`[TOKEN] ✘ Cloudflare challenge detected on attempt ${attempt}. Server IP is blocked by duel.com. Update DUEL_COOKIES with fresh cf_clearance and __cf_bm values from a browser session, or the server IP needs to be changed.`);
+                    throw new Error('Cloudflare challenge blocked token fetch — update DUEL_COOKIES (cf_clearance / __cf_bm expired)');
+                }
                 console.log(`[TOKEN] Raw response (attempt ${attempt}): length=${rawLength} bytes | body=${rawBody}`);
 
                 // 112 bytes = the only valid response shape.
