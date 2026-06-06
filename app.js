@@ -193,7 +193,7 @@ async function tatumGet(url, retries = 4) {
 
 // POST with Tatum API key
 async function tatumPost(url, body) {
-    const { data } = await axios.post(url, body, {
+    const { data } = await axios.post(url, JSON.stringify(body), {
         headers: { 'x-api-key': TATUM_API_KEY, 'Content-Type': 'application/json' },
         timeout: 15000
     });
