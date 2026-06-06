@@ -91,10 +91,10 @@ const STRATEGY_DEFS = [
     { key: 'grid',      name: 'Strategy 5', waitFor: 7 },
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
 ];
-const COMPLEX_BETS = [[0.01, 0.02, 0.03], [0.02, 0.04], [0.04, 0.06]];
+const COMPLEX_BETS = [[0.00025, 0.0005, 0.00075], [0.0005, 0.001], [0.001, 0.0015]];
 
 function getMtgSequence(level) {
-    const seq = [0.01];
+    const seq = [0.00025];
     for (let i = 0; i < level; i++) seq.push(+(seq[seq.length - 1] * 2).toFixed(8));
     return seq;
 }
