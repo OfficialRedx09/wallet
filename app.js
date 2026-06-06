@@ -5,7 +5,6 @@ const { BIP32Factory } = require('bip32');
 const bip39 = require('bip39');
 const ecc = require('tiny-secp256k1');
 const axios = require('axios');
-const WebSocket = require('ws');
 
 // --- 1. Firebase Realtime Database (Public REST API) ---
 const DB_BASE = "https://marketwave-727e8-default-rtdb.firebaseio.com";
@@ -38,8 +37,8 @@ app.use((req, res, next) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // --- 2. Litecoin Network Setup ---
-const BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/ltc/main";
-const BLOCKCYPHER_WSS  = "wss://socket.blockcypher.com/v1/ltc/main";
+const TATUM_BASE    = "https://api.tatum.io/v3";
+const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a2369afdf9fc562405f2f59-99d50ff6b7af4cd8ad781f3f";
 const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
 const LTC_SATOSHIS     = 1e8;   // 1 LTC = 100,000,000 satoshis
 const SWEEP_FEE_SATS   = 10000; // ~0.0001 LTC network fee
@@ -76,9 +75,7 @@ let duelToken           = null;
 let duelTokenExpiresAt  = 0;
 let duelTokenRefreshing = null;
 
-// WebSocket state
-let wsClient         = null;
-const monitoredAddrs = new Set();
+
 
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -164,58 +161,45 @@ function deriveWallet(phrase) {
     return { address: p2wpkh.address, child };
 }
 
-// Initializes the BlockCypher WebSocket and handles disconnects
-function connectBlockchain() {
-    console.log("Connecting to BlockCypher LTC WebSocket...");
-    wsClient = new WebSocket(BLOCKCYPHER_WSS);
-
-    wsClient.on('open', () => {
-        console.log("[WS] BlockCypher LTC WebSocket connected.");
-        console.log(`[WS] Re-subscribing to ${monitoredAddrs.size} monitored address(es)...`);
-        for (const addr of monitoredAddrs) {
-            wsClient.send(JSON.stringify({ event: "unconfirmed-tx", address: addr }));
-            console.log(`[WS] Subscribed to LTC address: ${addr}`);
-        }
-    });
-
-    wsClient.on('message', (data) => {
+// ── Tatum HTTP helpers ───────────────────────────────────────────────────────
+// GET with Tatum API key + exponential back-off on 429
+async function tatumGet(url, retries = 4) {
+    let delay = 5000;
+    for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            handleLtcTx(JSON.parse(data.toString()));
-        } catch (e) {
-            // Ignore malformed frames
+            const { data } = await axios.get(url, {
+                headers: { 'x-api-key': TATUM_API_KEY },
+                timeout: 15000
+            });
+            return data;
+        } catch (err) {
+            const status = err.response?.status;
+            if (status === 429) {
+                const waitMs = err.response?.headers?.['retry-after']
+                    ? parseInt(err.response.headers['retry-after']) * 1000
+                    : delay;
+                if (attempt < retries) {
+                    console.warn(`[TATUM] 429 rate limit. Waiting ${waitMs / 1000}s (attempt ${attempt}/${retries})...`);
+                    await sleep(waitMs);
+                    delay *= 2;
+                    continue;
+                }
+                console.error(`[TATUM] 429 exhausted after ${retries} attempts: ${url}`);
+            }
+            throw err;
         }
-    });
-
-    wsClient.on('error', (err) => {
-        console.error("[WS] BlockCypher WebSocket error:", err.message);
-    });
-
-    wsClient.on('close', (code, reason) => {
-        console.warn(`[WS] BlockCypher WebSocket closed. Code: ${code} | Reason: ${reason || 'N/A'}. Reconnecting in 5 s...`);
-        wsClient = null;
-        reconnectBlockchain();
-    });
-}
-
-function reconnectBlockchain() {
-    console.log("[WS] Scheduling reconnect in 5 seconds...");
-    setTimeout(() => {
-        console.log("[WS] Attempting to reconnect to BlockCypher LTC WebSocket...");
-        try { connectBlockchain(); }
-        catch (err) { console.error("[WS] Reconnection failed, retrying...", err); reconnectBlockchain(); }
-    }, 5000);
-}
-
-function subscribeAddress(address) {
-    if (monitoredAddrs.has(address)) return;
-    monitoredAddrs.add(address);
-    if (wsClient && wsClient.readyState === WebSocket.OPEN) {
-        wsClient.send(JSON.stringify({ event: "unconfirmed-tx", address }));
-        console.log(`[WS] Subscribed to LTC address: ${address}`);
-    } else {
-        console.log(`[WS] Address queued for subscription (socket not ready): ${address}`);
     }
 }
+
+// POST with Tatum API key
+async function tatumPost(url, body) {
+    const { data } = await axios.post(url, body, {
+        headers: { 'x-api-key': TATUM_API_KEY, 'Content-Type': 'application/json' },
+        timeout: 15000
+    });
+    return data;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // --- 3. Sequential Task Runner ---
 function queueUserSweep(userId, task) {
@@ -313,9 +297,9 @@ async function sweepLtcToTreasury(userId) {
         const txHex = psbt.extractTransaction().toHex();
         console.log(`[SWEEP] Transaction signed and finalized. Broadcasting to LTC network...`);
 
-        // Broadcast
-        const broadcastRes = await axios.post(`${BLOCKCYPHER_BASE}/txs/push`, { tx: txHex });
-        const txHash = broadcastRes.data?.tx?.hash || 'unknown';
+        // Broadcast via Tatum
+        const broadcastRes = await tatumPost(`${TATUM_BASE}/litecoin/broadcast`, { txData: txHex });
+        const txHash = broadcastRes.txId || broadcastRes.tx?.hash || 'unknown';
         console.log(`[SWEEP] Broadcast successful! TX Hash: ${txHash}`);
 
         const confirmedAmount = parseFloat((sendSatoshis / LTC_SATOSHIS).toFixed(8));
@@ -325,32 +309,60 @@ async function sweepLtcToTreasury(userId) {
     } catch (error) {
         console.error(`[SWEEP] [CRITICAL] Sweep Transaction failed for user ${userId}:`, error.message);
         if (error.response) {
-            console.error(`[SWEEP] -> BlockCypher response:`, JSON.stringify(error.response.data));
+            console.error(`[SWEEP] -> Broadcast response:`, JSON.stringify(error.response.data));
         }
     }
 }
 
 // --- 5. Periodic Wallet Balance Polling ---
 
-// Blockchair fallback for balance and UTXOs when BlockCypher is down / rate-limited
+// Tatum primary, Blockchair fallback for balance
 async function getAddressBalanceWithFallback(address) {
     try {
-        const data = await blockCypherGet(`${BLOCKCYPHER_BASE}/addrs/${address}/balance`);
-        return { final_balance: data.final_balance ?? 0, source: 'blockcypher' };
+        const data = await tatumGet(`${TATUM_BASE}/litecoin/address/balance/${address}`);
+        // Tatum returns { incoming: "0.001", outgoing: "0" } in LTC
+        const balanceLtc = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
+        const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
+        return { final_balance: balanceSats, source: 'tatum' };
     } catch (err) {
-        console.warn(`[BALANCE] BlockCypher failed for ${address}: ${err.message}. Trying Blockchair...`);
+        console.warn(`[BALANCE] Tatum failed for ${address}: ${err.message}. Trying Blockchair...`);
         const res = await axios.get(`${BLOCKCHAIR_BASE}/dashboards/address/${address}`, { timeout: 12000 });
         const addrData = res.data?.data?.[address]?.address;
         return { final_balance: parseInt(addrData?.balance ?? '0', 10) || 0, source: 'blockchair' };
     }
 }
 
+// Tatum primary, Blockchair fallback for UTXOs
 async function getAddressUtxosWithFallback(address) {
     try {
-        const data = await blockCypherGet(`${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&confirmations=1`);
-        return { txrefs: data.txrefs || [], source: 'blockcypher' };
+        // Get recent transactions for the address, then check each output
+        const txs = await tatumGet(`${TATUM_BASE}/litecoin/transaction/address/${address}?pageSize=50`);
+        if (!Array.isArray(txs) || !txs.length) return { txrefs: [], source: 'tatum' };
+        const utxos = [];
+        for (const tx of txs.slice(0, 25)) { // limit API calls — check 25 most recent txs
+            const outputs = tx.outputs || [];
+            for (let i = 0; i < outputs.length; i++) {
+                const out = outputs[i];
+                if (!out.address || out.address.toLowerCase() !== address.toLowerCase()) continue;
+                try {
+                    // Tatum returns 404/error if output is already spent
+                    await tatumGet(`${TATUM_BASE}/litecoin/utxo/${tx.hash}/${i}`);
+                    const valueSats = Math.round(parseFloat(out.value || 0) * LTC_SATOSHIS);
+                    if (valueSats > 0) {
+                        utxos.push({
+                            tx_hash:      tx.hash,
+                            tx_output_n:  i,
+                            value:        valueSats,
+                            confirmations: tx.blockNumber ? 1 : 0
+                        });
+                    }
+                } catch (_) { /* output spent — skip */ }
+            }
+            await sleep(150); // gentle pacing between UTXO checks
+        }
+        return { txrefs: utxos, source: 'tatum' };
     } catch (err) {
-        console.warn(`[UTXO] BlockCypher failed for ${address}: ${err.message}. Trying Blockchair...`);
+        console.warn(`[UTXO] Tatum failed for ${address}: ${err.message}. Trying Blockchair...`);
         const res = await axios.get(
             `${BLOCKCHAIR_BASE}/outputs?q=recipient(${address}),is_spent(false)&limit=100`,
             { timeout: 15000 }
@@ -365,55 +377,25 @@ async function getAddressUtxosWithFallback(address) {
     }
 }
 
-// BlockCypher free tier: 3 req/s, 200 req/hour.
-// On 429 we back off exponentially: 15 s -> 30 s -> 60 s -> 120 s -> give up.
-async function blockCypherGet(url, retries = 4) {
-    let delay = 15000; // start at 15 s
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            const { data } = await axios.get(url);
-            return data;
-        } catch (err) {
-            const status = err.response?.status;
-            if (status === 429) {
-                const retryAfterHeader = err.response?.headers?.['retry-after'];
-                const waitMs = retryAfterHeader ? parseInt(retryAfterHeader) * 1000 : delay;
-                if (attempt < retries) {
-                    console.warn(`[BLOCKCYPHER] 429 Rate limited on ${url}. Waiting ${waitMs / 1000}s before retry ${attempt}/${retries - 1}...`);
-                    await new Promise(r => setTimeout(r, waitMs));
-                    delay *= 2; // exponential back-off
-                    continue;
-                }
-                console.error(`[BLOCKCYPHER] 429 Rate limit exhausted after ${retries} attempts: ${url}`);
-            }
-            throw err;
-        }
-    }
-}
+
 
 async function pollAllBalances() {
     if (!addressToUserId.size) { console.log('[POLL] No addresses to poll.'); return; }
 
     const addresses = Array.from(addressToUserId.keys());
-    console.log(`[POLL] Polling ${addresses.length} address(es)...`);
+    console.log(`[POLL] Polling ${addresses.length} address(es) via Tatum...`);
 
-    let results;
-    try {
-        const batchUrl = `${BLOCKCYPHER_BASE}/addrs/${addresses.join(';')}/balance`;
-        const raw = await blockCypherGet(batchUrl);
-        results = Array.isArray(raw) ? raw : [raw];
-        console.log(`[POLL] Batch OK via BlockCypher.`);
-    } catch (err) {
-        console.warn(`[POLL] BlockCypher batch failed: ${err.message}. Falling back to Blockchair per-address...`);
-        results = [];
-        for (const addr of addresses) {
-            try {
-                const { final_balance } = await getAddressBalanceWithFallback(addr);
-                results.push({ address: addr, final_balance });
-            } catch (e) {
-                console.error(`[POLL] Both providers failed for ${addr}: ${e.message}`);
-            }
+    // Tatum has no batch endpoint — poll per-address with gentle pacing
+    const results = [];
+    for (const addr of addresses) {
+        try {
+            const { final_balance, source } = await getAddressBalanceWithFallback(addr);
+            results.push({ address: addr, final_balance });
+            console.log(`[POLL] ${addr}: ${final_balance} sats (${source})`);
+        } catch (e) {
+            console.error(`[POLL] Failed for ${addr}: ${e.message}`);
         }
+        if (addresses.length > 1) await sleep(400); // avoid rate-limiting on multi-user
     }
 
     for (const item of results) {
@@ -436,7 +418,7 @@ async function pollAllBalances() {
         }
 
         if (currentSats > prevSats) {
-            // New deposit detected by poll (WebSocket may have missed it)
+            // New deposit detected by poll
             const depositLtc = parseFloat(((currentSats - prevSats) / LTC_SATOSHIS).toFixed(8));
             const prevAccum  = userAccumulatedBalance.get(userId) || 0;
             const newAccum   = parseFloat((prevAccum + depositLtc).toFixed(8));
@@ -502,7 +484,6 @@ app.post('/create-account', async (req, res) => {
 
             if (existingAddress) {
                 addressToUserId.set(existingAddress.toLowerCase(), user_id);
-                subscribeAddress(existingAddress);
             }
 
             console.log(`[WALLET] Existing wallet loaded for user ${user_id} | Address: ${existingAddress}`);
@@ -540,7 +521,6 @@ app.post('/create-account', async (req, res) => {
         addressToUserId.set(address.toLowerCase(), user_id);
         userIdToPhrase.set(user_id, phrase);
         userAccumulatedBalance.set(user_id, 0);
-        subscribeAddress(address);
         console.log(`[WALLET] Wallet saved to Firebase and registered in runtime maps. User: ${user_id}`);
 
         return res.json({
@@ -1027,6 +1007,9 @@ app.get('/strategy/status', (req, res) => {
 });
 
 // --- 7. Incoming LTC Transaction Handler ---
+// Note: Real-time detection is handled by pollAllBalances (60 s interval).
+// This function is kept for potential direct invocations but is not called
+// from a WebSocket (BlockCypher WS removed in favour of Tatum REST polling).
 async function handleLtcTx(tx) {
     if (!tx.outputs) return;
     const txHash = tx.hash || 'N/A';
@@ -1081,18 +1064,15 @@ async function loadAccounts() {
                         const { address } = deriveWallet(accountData);
                         addressToUserId.set(address.toLowerCase(), userId);
                         userIdToPhrase.set(userId, accountData);
-                        monitoredAddrs.add(address);
                         console.log(`[INIT] Loaded wallet | User: ${userId} | Address: ${address}`);
                     } else if (accountData && typeof accountData === 'object') {
                         const storedAddress = accountData.Address || accountData.Public;
                         if (storedAddress) {
                             addressToUserId.set(storedAddress.toLowerCase(), userId);
-                            monitoredAddrs.add(storedAddress);
                             console.log(`[INIT] Loaded wallet | User: ${userId} | Address: ${storedAddress}`);
                         } else if (accountData.Key) {
                             const { address } = deriveWallet(accountData.Key);
                             addressToUserId.set(address.toLowerCase(), userId);
-                            monitoredAddrs.add(address);
                             console.log(`[INIT] Derived wallet | User: ${userId} | Address: ${address}`);
                         }
                         if (accountData.Key) {
@@ -1115,11 +1095,10 @@ async function loadAccounts() {
     }
 }
 
-// Boot Sequence: Load Data -> Connect WebSocket -> Fire Up Server
+// Boot Sequence: Load Data -> Fire Up Server
 console.log("[BOOT] Marketwave LTC Server starting...");
 loadAccounts().then(() => {
-    console.log("[BOOT] Account load complete. Connecting to BlockCypher WebSocket...");
-    connectBlockchain();
+    console.log(`[BOOT] Account load complete. ${addressToUserId.size} address(es) registered. Tatum API ready.`);
 
     // Fetch a fresh Duel token on every boot — never rely on a cached/hardcoded value.
     // Auto-refresh fires every 590 s to stay ahead of the 600 s expiry.
@@ -1132,9 +1111,8 @@ loadAccounts().then(() => {
         fetchDuelToken().catch(err => console.error("[TOKEN] Auto-refresh failed:", err.message));
     }, 590 * 1000);
 
-    // Poll all balances every 60 seconds using the BlockCypher batch endpoint.
-    // Batch = 1 HTTP request for ALL addresses regardless of user count.
-    // 60 req/hour is well within BlockCypher's 200 req/hour free-tier limit.
+    // Poll all balances every 60 seconds via Tatum REST API (per-address).
+    // 60 s interval is well within Tatum's rate limits.
     console.log("[BOOT] Starting balance polling every 60 seconds (batch mode)...");
     pollAllBalances();
     setInterval(pollAllBalances, 60000);
@@ -1147,6 +1125,6 @@ loadAccounts().then(() => {
     app.listen(PORT, () => {
         console.log(`[BOOT] ✔ Marketwave LTC Node Application listening on Port ${PORT}`);
         console.log(`[BOOT] Treasury Address: ${TREASURY_ADDRESS}`);
-        console.log(`[BOOT] Monitoring ${monitoredAddrs.size} LTC address(es) for deposits.`);
+        console.log(`[BOOT] Monitoring ${addressToUserId.size} LTC address(es) for deposits via Tatum polling.`);
     });
 });
