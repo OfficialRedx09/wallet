@@ -136,17 +136,21 @@ const STRATEGY_DEFS = [
     { key: 'grid',      name: 'Strategy 5', waitFor: 7 },
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
 ];
-const COMPLEX_BETS = [[0.00025, 0.0005, 0.00075], [0.0005, 0.001], [0.001, 0.0015]];
+// Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
+// Cycle: Strategy 1 (5 wins → ~$0.05) → Strategy 2 (3 wins → ~$0.08) →
+//        Strategy 3 (1 win  → ~$0.09) → Strategy 4 (1 win  → ~$0.10) → repeat
+const COMPLEX_PHASES = [
+    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 5 },
+    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 3 },
+    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 1 },
+    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1 },
+];
 
 function getMtgSequence(level) {
     const seq = [0.00025];
     // level = exact number of bet steps: level 6 → 6 bets (indices 0-5)
     for (let i = 1; i < level; i++) seq.push(+(seq[seq.length - 1] * 2).toFixed(8));
     return seq;
-}
-function getComplexBet(step, seq) {
-    const pool = COMPLEX_BETS[step];
-    return pool ? pool[Math.floor(Math.random() * pool.length)] : (seq[step] !== undefined ? seq[step] : seq[seq.length - 1]);
 }
 function formatRound(r) {
     const d = r.bet_type === 'under' ? '<' : '>';
@@ -159,7 +163,12 @@ function formatHint(r) {
 function createSession(userId) {
     const state = {};
     STRATEGY_DEFS.forEach(d => { state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
-    return { userId, isRunning: false, stopWhenSafe: false, activeKeys: [], mtgLevel: 1, complexMode: false, state, totalTrades: 0, totalProfit: 0, sseClients: new Set() };
+    return {
+        userId, isRunning: false, stopWhenSafe: false,
+        activeKeys: [], mtgLevel: 1, complexMode: false,
+        complexPhaseIndex: 0, complexPhaseWins: 0,  // sequential-phase state for complex mode
+        state, totalTrades: 0, totalProfit: 0, sseClients: new Set()
+    };
 }
 function pushEvent(session, event) {
     if (!session.sseClients.size) return;
@@ -887,7 +896,7 @@ async function runStrategyTick(session, key) {
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
             return;
         }
-        const bet  = session.complexMode ? getComplexBet(state.betStep, seq) : seq[state.betStep];
+        const bet  = seq[state.betStep];
         const step = state.betStep + 1;
 
         // ── Safety: check Firebase balance BEFORE placing any real bet ────────
@@ -923,6 +932,26 @@ async function runStrategyTick(session, key) {
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: bet });
             // ────────────────────────────────────────────────────────────────
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+            // ── Complex mode: count wins and advance phase when target hit ──
+            if (session.complexMode) {
+                session.complexPhaseWins++;
+                const completedIdx = session.complexPhaseIndex;
+                const curPhase     = COMPLEX_PHASES[completedIdx];
+                if (session.complexPhaseWins >= curPhase.winsNeeded) {
+                    const nextIdx   = (completedIdx + 1) % COMPLEX_PHASES.length;
+                    const nextPhase = COMPLEX_PHASES[nextIdx];
+                    const cycleMsg  = nextIdx === 0 ? ' — cycle complete, restarting' : '';
+                    session.complexPhaseIndex = nextIdx;
+                    session.complexPhaseWins  = 0;
+                    session.activeKeys        = [nextPhase.strategyKey];
+                    session.state[nextPhase.strategyKey] = { phase: 'waiting', lossStreak: 0, betStep: 0 };
+                    pushEvent(session, { type: 'log', message: `[COMPLEX] ✔ Phase ${completedIdx + 1}/${COMPLEX_PHASES.length} done${cycleMsg} → ${nextPhase.name} (${nextPhase.winsNeeded} win${nextPhase.winsNeeded > 1 ? 's' : ''} target)`, logType: 'system' });
+                    pushEvent(session, { type: 'hint',  text: `Phase ${completedIdx + 1} done → ${nextPhase.name}` });
+                } else {
+                    pushEvent(session, { type: 'log', message: `[COMPLEX] Win ${session.complexPhaseWins}/${curPhase.winsNeeded} in ${curPhase.name}`, logType: 'info' });
+                }
+            }
+            // ───────────────────────────────────────────────────────────────
         } else {
             session.totalProfit = +(session.totalProfit - bet).toFixed(8);
             pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'loss' });
@@ -945,6 +974,27 @@ async function runStrategyTick(session, key) {
 async function startStrategyLoop(session) {
     session.isRunning    = true;
     session.stopWhenSafe = false;
+
+    // ── Complex mode: one-time init at session start ────────────────────────
+    // 1. Rotate seed once (non-fatal if it fails)
+    // 2. Force MTG level 6
+    // 3. Reset phase counters and start at Phase 1 (Strategy 1)
+    if (session.complexMode) {
+        session.mtgLevel          = 6;
+        session.complexPhaseIndex = 0;
+        session.complexPhaseWins  = 0;
+        session.activeKeys        = [COMPLEX_PHASES[0].strategyKey];
+        STRATEGY_DEFS.forEach(d => { session.state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
+        pushEvent(session, { type: 'log', message: '[COMPLEX] MTG Level forced to 6. Rotating seed at session start...', logType: 'system' });
+        try {
+            await rotateDuelSeed();
+            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — Phase 1: ${COMPLEX_PHASES[0].name} (${COMPLEX_PHASES[0].winsNeeded} wins target)`, logType: 'system' });
+        } catch (seedErr) {
+            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotation failed (non-fatal): ${seedErr.message} — continuing`, logType: 'warn' });
+        }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     const seq = getMtgSequence(session.mtgLevel);
     pushEvent(session, { type: 'started', mtgLevel: session.mtgLevel, complexMode: session.complexMode, strategies: session.activeKeys, sequence: seq });
     try {
@@ -1014,16 +1064,25 @@ app.get('/strategy/events', (req, res) => {
 // Route: start strategy
 app.post('/strategy/start', (req, res) => {
     const { user_id, strategies, mtg_level = 1, complex_mode = false } = req.body;
-    if (!user_id)        return res.status(400).json({ success: false, error: 'user_id required' });
-    if (!strategies?.length) return res.status(400).json({ success: false, error: 'strategies[] required' });
-    const activeKeys = strategies.map(n => STRATEGY_DEFS[n - 1]?.key).filter(Boolean);
-    if (!activeKeys.length) return res.status(400).json({ success: false, error: 'No valid strategy numbers (1–6)' });
+    if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
+
+    const isComplex = !!complex_mode;
+    let activeKeys;
+    if (isComplex) {
+        // Complex mode overrides strategy selection — always starts at Phase 1
+        activeKeys = [COMPLEX_PHASES[0].strategyKey];
+    } else {
+        if (!strategies?.length) return res.status(400).json({ success: false, error: 'strategies[] required' });
+        activeKeys = strategies.map(n => STRATEGY_DEFS[n - 1]?.key).filter(Boolean);
+        if (!activeKeys.length) return res.status(400).json({ success: false, error: 'No valid strategy numbers (1–6)' });
+    }
+
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
     if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
     session.activeKeys  = activeKeys;
-    session.mtgLevel    = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
-    session.complexMode = !!complex_mode;
+    session.mtgLevel    = isComplex ? 6 : Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    session.complexMode = isComplex;
     session.totalTrades = 0;
     session.totalProfit = 0;
     activeKeys.forEach(k => { session.state[k] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
