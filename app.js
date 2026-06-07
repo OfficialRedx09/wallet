@@ -74,6 +74,22 @@ const lastOnChainSats        = new Map(); // userId -> last polled on-chain sats
 const userAccumulatedBalance = new Map(); // userId -> lifetime accumulated LTC (never decreases after sweep)
 const strategySessions       = new Map(); // userId -> strategy session
 
+// ── Telegram notification config ──────────────────────────────────────────────
+// Bot token is hard-coded; set TELEGRAM_CHAT_ID env var to your admin chat ID.
+// To get your chat ID: message the bot once, then visit:
+//   https://api.telegram.org/bot<TOKEN>/getUpdates
+const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '8828699174:AAFz6gwpQVv5ppHod9tV3nb-7K-6FpY2ynQ';
+const TELEGRAM_CHAT_ID      = process.env.TELEGRAM_CHAT_ID   || '';  // set via env
+const SERVER_ID             = process.env.SERVER_ID           || '102030';
+const SERVER_NO             = process.env.SERVER_NO           || '01';
+const COMPLEX_PROFIT_TARGET = 0.50;                   // $0.50 profit triggers notification + lock
+const LTC_TO_BDT_RATE       = 5000;                   // 1 LTC ≈ 5000 BDT  (balance / 0.00025 × 1.25)
+const USER_LOCK_DURATION_MS = 20 * 60 * 60 * 1000;   // 20 hours in ms
+
+// Per-user bet lock — user cannot trade for 20 h after complex-mode profit target is hit
+const userBetLocks          = new Map(); // userId -> lockUntilTimestamp (ms epoch)
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── Per-user Firebase balance lock — serialises concurrent R-M-W ops ─────────
 const _balanceLocks = new Map();
 function acquireBalanceLock(userId, fn) {
@@ -128,6 +144,83 @@ let duelTokenRefreshing = null;
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// Random trade delay 100 – 1000 ms — reduces bot-detection timing fingerprint
+const randomDelay = () => sleep(100 + Math.floor(Math.random() * 900));
+
+// ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
+const _MOBILE_UAS = [
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
+];
+const _ACCEPT_LANGS = [
+    'en-GB,en;q=0.9', 'en-GB,en;q=0.8', 'en-GB,en;q=0.7',
+    'en-GB,en;q=0.6', 'en-US,en;q=0.9,en-GB;q=0.8',
+];
+function _randomBetHeaders() {
+    return {
+        'user-agent':      _MOBILE_UAS[Math.floor(Math.random() * _MOBILE_UAS.length)],
+        'accept-language': _ACCEPT_LANGS[Math.floor(Math.random() * _ACCEPT_LANGS.length)],
+        'priority':        Math.random() > 0.6 ? 'u=1, i' : 'u=3, i',
+        'sec-gpc':         Math.random() > 0.3 ? '1' : '0',
+    };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Format milliseconds → "Xh Ym" / "Ym Zs" / "Zs" human-readable
+function formatDuration(ms) {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${r}s`;
+    return `${r}s`;
+}
+
+// Returns lock info if the user's 20-h bet lock is still active, otherwise null
+function getUserLockInfo(userId) {
+    const until = userBetLocks.get(userId);
+    if (!until || Date.now() >= until) return null;
+    return { locked: true, lockUntil: until, remainingMs: until - Date.now() };
+}
+
+// Send an HTML message to a Telegram chat via Bot API (fire-and-forget safe)
+async function sendTelegramMessage(chatId, text) {
+    if (!chatId) { console.warn('[TELEGRAM] TELEGRAM_CHAT_ID not configured — skipping notification'); return; }
+    try {
+        await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            { chat_id: chatId, text, parse_mode: 'HTML' },
+            { timeout: 10000 }
+        );
+        console.log(`[TELEGRAM] Notification sent to chat ${chatId}`);
+    } catch (err) {
+        console.error(`[TELEGRAM] Failed to send message: ${err.message}`);
+    }
+}
+
+// Build and send the complex-mode profit-target notification
+async function sendProfitTargetNotification(session, currentBalance) {
+    const ts         = getDhakaTimestamp();
+    const runtimeMs  = Date.now() - (session.sessionStartTime || Date.now());
+    const runtimeStr = formatDuration(runtimeMs);
+    const bdtStr     = (currentBalance * LTC_TO_BDT_RATE).toFixed(2);
+    const maxMtg     = session.maxMtgStepReached || 0;
+    const msg = [
+        `🔰<b>Server ID</b> : ${SERVER_ID}`,
+        `<b>Server No</b> : ${SERVER_NO}`,
+        `<b>Profit target</b> : reached ✅`,
+        `<b>Date</b> : ${ts.date}`,
+        `<b>Time</b> : ${ts.time}`,
+        `<b>Runtime</b> : ${runtimeStr}`,
+        `<b>Current balance</b> : ${currentBalance.toFixed(8)} LTC (${bdtStr} BDT)`,
+        `<b>Max MTG NEEDED</b> : ${maxMtg}`,
+    ].join('\n');
+    await sendTelegramMessage(TELEGRAM_CHAT_ID, msg);
+}
+
 const STRATEGY_DEFS = [
     { key: 'scalp',     name: 'Strategy 1', waitFor: 3 },
     { key: 'arbitrage', name: 'Strategy 2', waitFor: 4 },
@@ -137,12 +230,12 @@ const STRATEGY_DEFS = [
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
 ];
 // Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
-// Cycle: Strategy 1 (3 wins → ~$0.03) → Strategy 2 (5 wins → ~$0.08) →
-//        Strategy 3 (1 win  → ~$0.09) → Strategy 4 (1 win  → ~$0.10) → repeat
+// Cycle: Strategy 1 (2 wins → ~$0.02) → Strategy 2 (5 wins → ~$0.07) →
+//        Strategy 3 (2 win  → ~$0.09) → Strategy 4 (1 win  → ~$0.10) → repeat
 const COMPLEX_PHASES = [
-    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 3 },
+    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 2 },
     { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 5 },
-    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 1 },
+    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 2 },
     { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1 },
 ];
 
@@ -167,7 +260,10 @@ function createSession(userId) {
         userId, isRunning: false, stopWhenSafe: false,
         activeKeys: [], mtgLevel: 1, complexMode: false,
         complexPhaseIndex: 0, complexPhaseWins: 0,  // sequential-phase state for complex mode
-        state, totalTrades: 0, totalProfit: 0, sseClients: new Set()
+        state, totalTrades: 0, totalProfit: 0, sseClients: new Set(),
+        // Profit tracking & session metadata
+        startBalance: null, sessionStartTime: Date.now(),
+        maxMtgStepReached: 0, profitTargetReached: false
     };
 }
 function pushEvent(session, event) {
@@ -727,15 +823,14 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
     const makeRequest = async (token) => {
         const headers = {
             'accept':                   'application/json, text/plain, */*',
-            'accept-language':          'en-GB,en;q=0.6',
             'content-type':             'application/json',
             'cookie':                   DUEL_COOKIES,
             'origin':                   'https://duel.com',
             'referer':                  'https://duel.com/dice',
-            'user-agent':               'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
             'x-duel-device-identifier': DUEL_DEVICE_UUID,
             'x-env-class':              'blue',
             'x-security-token':         token,
+            ..._randomBetHeaders(),    // rotates UA / accept-language / priority / sec-gpc
             ...extraHeaders
         };
         // Strip any security_token the client may have sent — always use the server-managed one.
@@ -868,11 +963,30 @@ async function runStrategyTick(session, key) {
     const state = session.state[key];
     const seq   = getMtgSequence(session.mtgLevel);
 
+    // ── Bet lock check — enforced for ALL bet types ───────────────────────────
+    const lockInfo = getUserLockInfo(session.userId);
+    if (lockInfo) {
+        pushEvent(session, { type: 'error', code: 'BET_LOCKED', message: 'Trading locked — 20-hour cooldown active', detail: `Profit target was reached. Trading resumes at ${new Date(lockInfo.lockUntil).toUTCString()}`, action: `Remaining: ${formatDuration(lockInfo.remainingMs)}` });
+        session.isRunning = false;
+        return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (state.phase === 'waiting') {
         const r = await placeDiceBet(0);
         if (!r.success) {
-            pushEvent(session, { type: 'log', message: `[${def.name}] API error: ${r.error}`, logType: 'error' });
-            if (/rejected|expired|cookie/i.test(r.error)) session.isRunning = false;
+            if (/rejected|expired|cookie/i.test(r.error)) {
+                pushEvent(session, { type: 'log', message: `[${def.name}] Auth error: ${r.error}`, logType: 'error' });
+                session.isRunning = false;
+                return;
+            }
+            // Non-fatal API error — wait 60 s with countdown; scan position is preserved
+            pushEvent(session, { type: 'error', code: 'API_ERROR', message: 'API error — retrying scan in 60s', detail: r.error, action: 'Scan position preserved — waiting 60 seconds' });
+            for (let remaining = 60; remaining > 0; remaining -= 5) {
+                if (!session.isRunning) return;
+                pushEvent(session, { type: 'log', message: `  [${def.name}] API error — retrying in ${remaining}s...`, logType: 'warn' });
+                await sleep(5000);
+            }
             return;
         }
         pushEvent(session, { type: 'statusBar', mtgStep: 0, amount: 0, result: r.isWin ? 'win' : 'loss' });
@@ -899,6 +1013,9 @@ async function runStrategyTick(session, key) {
         const bet  = seq[state.betStep];
         const step = state.betStep + 1;
 
+        // Track highest MTG step reached this session
+        if (step > session.maxMtgStepReached) session.maxMtgStepReached = step;
+
         // ── Safety: check Firebase balance BEFORE placing any real bet ────────
         const currentBalance = await getUserBalance(session.userId);
         if (currentBalance === null) {
@@ -917,9 +1034,19 @@ async function runStrategyTick(session, key) {
 
         const r = await placeDiceBet(bet);
         if (!r.success) {
-            pushEvent(session, { type: 'error', code: 'BET_FAILED', message: `Bet failed: ${r.error}`, detail: `Strategy: ${def.name} | Step: ${step}/${seq.length} | Amount: $${bet}`, action: /rejected|expired|cookie/i.test(r.error) ? 'Update DUEL_COOKIES on server — strategy stopped' : 'Retrying next tick' });
-            if (/rejected|expired|cookie/i.test(r.error)) session.isRunning = false;
-            return;
+            if (/rejected|expired|cookie/i.test(r.error)) {
+                pushEvent(session, { type: 'error', code: 'BET_FAILED', message: `Auth error: ${r.error}`, detail: `Strategy: ${def.name} | Step: ${step}/${seq.length} | Amount: $${bet}`, action: 'Update DUEL_COOKIES on server — strategy stopped' });
+                session.isRunning = false;
+                return;
+            }
+            // Non-fatal API error — betStep is NOT incremented so we retry the exact same bet
+            pushEvent(session, { type: 'error', code: 'API_ERROR', message: `Bet API error — retrying in 60s`, detail: `${r.error} | MTG Step ${step}/${seq.length} retained`, action: 'Waiting 60 seconds before retry...' });
+            for (let remaining = 60; remaining > 0; remaining -= 5) {
+                if (!session.isRunning) return;
+                pushEvent(session, { type: 'log', message: `  [${def.name}] API error — retrying in ${remaining}s (Step ${step}/${seq.length} retained)`, logType: 'warn' });
+                await sleep(5000);
+            }
+            return; // betStep unchanged — next tick retries the exact same bet
         }
         session.totalTrades++;
         if (r.isWin) {
@@ -932,7 +1059,7 @@ async function runStrategyTick(session, key) {
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: bet });
             // ────────────────────────────────────────────────────────────────
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
-            // ── Complex mode: count wins and advance phase when target hit ──
+            // ── Complex mode: count wins, advance phase, check profit target ─
             if (session.complexMode) {
                 session.complexPhaseWins++;
                 const completedIdx = session.complexPhaseIndex;
@@ -950,6 +1077,25 @@ async function runStrategyTick(session, key) {
                 } else {
                     pushEvent(session, { type: 'log', message: `[COMPLEX] Win ${session.complexPhaseWins}/${curPhase.winsNeeded} in ${curPhase.name}`, logType: 'info' });
                 }
+                // ── Profit target check ($0.50 above starting balance) ───────
+                if (!session.profitTargetReached && newBal !== null && session.startBalance !== null) {
+                    const profit = newBal - session.startBalance;
+                    if (profit >= COMPLEX_PROFIT_TARGET) {
+                        session.profitTargetReached = true;
+                        pushEvent(session, { type: 'profit_target', balance: newBal, profit, startBalance: session.startBalance });
+                        pushEvent(session, { type: 'log', message: `[COMPLEX] 🎯 Profit target $${COMPLEX_PROFIT_TARGET} reached! Profit: +$${profit.toFixed(4)} | Balance: ${newBal.toFixed(8)} LTC`, logType: 'success' });
+                        // Lock user for 20 hours
+                        userBetLocks.set(session.userId, Date.now() + USER_LOCK_DURATION_MS);
+                        const lockUntil = new Date(userBetLocks.get(session.userId)).toISOString();
+                        console.log(`[LOCK] User ${session.userId} locked for 20 h — until ${lockUntil}`);
+                        pushEvent(session, { type: 'log', message: `[LOCK] Trading locked for 20 hours — resumes at ${lockUntil}`, logType: 'system' });
+                        // Send Telegram notification (non-blocking)
+                        sendProfitTargetNotification(session, newBal).catch(e => console.error('[TELEGRAM]', e.message));
+                        session.isRunning = false;
+                        return;
+                    }
+                }
+                // ────────────────────────────────────────────────────────────
             }
             // ───────────────────────────────────────────────────────────────
         } else {
@@ -974,6 +1120,17 @@ async function runStrategyTick(session, key) {
 async function startStrategyLoop(session) {
     session.isRunning    = true;
     session.stopWhenSafe = false;
+
+    // ── Capture starting balance + session metadata for profit tracking ───────
+    {
+        const initBal = await getUserBalance(session.userId);
+        session.startBalance        = initBal !== null ? initBal : 0;
+        session.sessionStartTime    = Date.now();
+        session.maxMtgStepReached   = 0;
+        session.profitTargetReached = false;
+        console.log(`[STRATEGY] Starting balance for ${session.userId}: ${session.startBalance.toFixed(8)} LTC`);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // ── Complex mode: one-time init at session start ────────────────────────
     // 1. Rotate seed once (non-fatal if it fails)
@@ -1018,7 +1175,7 @@ async function startStrategyLoop(session) {
                 console.log(`[STRATEGY] Safe stop pending for ${session.userId} — MTG set in progress, continuing...`);
             }
             // ─────────────────────────────────────────────────────────────────
-            if (session.isRunning) await sleep(800);
+            if (session.isRunning) await randomDelay();
         }
     } catch (err) {
         console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
@@ -1077,6 +1234,16 @@ app.post('/strategy/start', (req, res) => {
         if (!activeKeys.length) return res.status(400).json({ success: false, error: 'No valid strategy numbers (1–6)' });
     }
 
+    // Check 20-hour bet lock before allowing a new session to start
+    const startLock = getUserLockInfo(user_id);
+    if (startLock) {
+        return res.status(403).json({
+            success:     false,
+            error:       `Trading locked for 20 hours. Remaining: ${formatDuration(startLock.remainingMs)}`,
+            lockedUntil: new Date(startLock.lockUntil).toISOString()
+        });
+    }
+
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
     if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
@@ -1092,6 +1259,21 @@ app.post('/strategy/start', (req, res) => {
     });
     console.log(`[STRATEGY] Started for ${user_id} | keys:${activeKeys} level:${session.mtgLevel} complex:${session.complexMode}`);
     return res.json({ success: true, strategies: activeKeys, mtgLevel: session.mtgLevel, complexMode: session.complexMode, sequence: getMtgSequence(session.mtgLevel) });
+});
+
+// Route: check 20-hour bet lock status
+app.get('/strategy/lock-status', (req, res) => {
+    const userId = req.query.user_id;
+    if (!userId) return res.status(400).json({ success: false, error: 'user_id required' });
+    const lockInfo = getUserLockInfo(userId);
+    if (!lockInfo) return res.json({ success: true, locked: false });
+    return res.json({
+        success:            true,
+        locked:             true,
+        lockUntil:          new Date(lockInfo.lockUntil).toISOString(),
+        remainingMs:        lockInfo.remainingMs,
+        remainingFormatted: formatDuration(lockInfo.remainingMs)
+    });
 });
 
 // Route: stop strategy
