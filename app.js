@@ -59,8 +59,12 @@ const LITECOIN_NETWORK = {
 const DUEL_TOKEN_URL    = "https://duel.com/api/v2/user/security/token";
 const DUEL_BET_URL      = "https://duel.com/api/v2/dice/bet";
 const BLOCKCHAIR_BASE   = "https://api.blockchair.com/litecoin";
+const DUEL_SEED_ROTATE_URL = "https://duel.com/api/v2/client-seed/rotate";
 const DUEL_DEVICE_UUID  = process.env.DUEL_DEVICE_UUID  || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
+// Mobile session cookies — used for all betting calls
 const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "_sp_ses.d35b=*; duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; env_class=blue; __cf_bm=VStC4zY6cE1KA3LiiKlkdGntPXUGmmpTrCeDvDpek4Q-1780793051.4816592-1.0.1.1-mAUAzG504OpcxaiYq7.M.kkZVJltBNfMeB0NYhsH7j_3LHwps9iNmBldo.MRaAXJMv7KbOXRra2_7fftHoRLiOfmwN3JaU_v4gEGYHJX7E_CQMnxCdjSYZaV6vBjLI8H; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.1.1780793058..6ea60967-0e40-4ad7-b68a-a0ed4ee85838..82d6b3cc-b57c-4085-8641-199b013583e8.1780793046753.9";
+// Desktop session cookies — used exclusively for seed rotation (separate cf_clearance)
+const DUEL_SEED_COOKIES = process.env.DUEL_SEED_COOKIES || "duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; _sp_ses.d35b=*; cf_clearance=0azt0u7AEb9PL9puC_mtGV.4UsNlBFXB8PlRG8IVaUw-1780797543-1.2.1.1-afHmObdO4TvSjFxk8R7zyuMtFVvrdc8jLvL0kE5scoWaY.LV2C5lr3mEvZ2jicGm5StD65cxcprimS99mmKBhIXtLQQf_VpG0.Bm4piZKRFfRxuGuzq7jIXZ.NOUmNHIOLLUk8NEyca03hXhAfI8Vn9nIO_aVIt_VYvlaexoNcKYRcbabJumntBTokCQr9LT4ihTPU67DaFpyC3hokty9Qj4ptvI4k5wRN6GpUQfgly0xBhhU_vcdrWCsTHWVUZGhl8g.McFtZlp6iqz.vkYCVpER3.DGrjuR1kAnY1MaIAAnsOM6FwH1x.m9ospNj.3CJK9.3HDEu1eNLma9MHrcxBDz9h5hQy.oFBadZHDyxcb1pxKumuk4sPx5nli.xLO0Q1IC9h_5YflcpVGzWS6kMkkTILOpXKksEbS6iuwpGM; __cf_bm=caQj4DVoVqRW4VAjDqT_i1UdIXzdf9ol4ARiI8vq2e0-1780797546.326099-1.0.1.1-Ii960dRYm7J6eFwWzdUP4f8pf1KEVBE2c8bnd50ceuE8JM_KvvfrgVyrZ2BX2cGG03Qosw_92FBJmA9QamOHsie67yauty6JEde4f7B1nLvUuvp3ofjTk1SOH7rfeztH; env_class=blue; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.2.1780797752.1780795546.5a59b211-7504-4443-be44-d171383b4fce.6ea60967-0e40-4ad7-b68a-a0ed4ee85838.1227487e-b463-4bda-a7d5-89c55b46d832.1780797472489.72";
 
 // Core Lookup Maps
 const addressToUserId        = new Map();
@@ -85,6 +89,32 @@ let _duelBetQueue = Promise.resolve();
 function enqueueDuelBet(fn) {
     const next = _duelBetQueue.then(() => fn(), () => fn());
     _duelBetQueue = next.then(() => undefined, () => undefined);
+    return next;
+}
+
+// ── Seed rotation rate limiter — max 1 call per 60 s ─────────────────────────
+// Queued requests wait for the next available 60 s window before executing.
+let _lastSeedRotateAt = 0;
+let _seedRotateQueue  = Promise.resolve();
+function enqueueSeedRotate(fn) {
+    const next = _seedRotateQueue.then(
+        async () => {
+            const waitMs = Math.max(0, 60000 - (Date.now() - _lastSeedRotateAt));
+            if (waitMs > 0) {
+                console.log(`[SEED] Rate limit: waiting ${(waitMs / 1000).toFixed(1)}s...`);
+                await sleep(waitMs);
+            }
+            _lastSeedRotateAt = Date.now();
+            return fn();
+        },
+        async () => {
+            const waitMs = Math.max(0, 60000 - (Date.now() - _lastSeedRotateAt));
+            if (waitMs > 0) await sleep(waitMs);
+            _lastSeedRotateAt = Date.now();
+            return fn();
+        }
+    );
+    _seedRotateQueue = next.then(() => undefined, () => undefined);
     return next;
 }
 
@@ -1028,6 +1058,66 @@ app.post('/strategy/update', (req, res) => {
     const seq = getMtgSequence(session.mtgLevel);
     pushEvent(session, { type: 'updated', mtgLevel: session.mtgLevel, complexMode: session.complexMode, strategies: session.activeKeys, sequence: seq });
     return res.json({ success: true, mtgLevel: session.mtgLevel, complexMode: session.complexMode });
+});
+
+// Route: rotate Duel client seed — rate-limited to 1 call per 60 s globally
+// GET /change_seed  — any authenticated user may call; excess requests are queued
+function generateClientSeed(len = 16) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let s = '';
+    for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    return s;
+}
+
+async function rotateDuelSeed() {
+    const clientSeed = generateClientSeed(16);
+    console.log(`[SEED] Rotating client seed → ${clientSeed}`);
+    const { data } = await axios.post(
+        DUEL_SEED_ROTATE_URL,
+        { client_seed: clientSeed },
+        {
+            headers: {
+                'accept':                      'application/json, text/plain, */*',
+                'accept-encoding':             'gzip, deflate, br, zstd',
+                'accept-language':             'en-GB,en;q=0.6',
+                'content-type':                'application/json',
+                'cookie':                      DUEL_SEED_COOKIES,
+                'origin':                      'https://duel.com',
+                'priority':                    'u=1, i',
+                'referer':                     'https://duel.com/dice',
+                'sec-ch-ua':                   '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-arch':              '"x86"',
+                'sec-ch-ua-bitness':           '"64"',
+                'sec-ch-ua-full-version-list': '"Brave";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"',
+                'sec-ch-ua-mobile':            '?0',
+                'sec-ch-ua-model':             '""',
+                'sec-ch-ua-platform':          '"Windows"',
+                'sec-ch-ua-platform-version':  '"19.0.0"',
+                'sec-fetch-dest':              'empty',
+                'sec-fetch-mode':              'cors',
+                'sec-fetch-site':              'same-origin',
+                'sec-gpc':                     '1',
+                'user-agent':                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'x-duel-device-identifier':    DUEL_DEVICE_UUID,
+                'x-env-class':                 'blue'
+            },
+            timeout: 15000
+        }
+    );
+    console.log(`[SEED] Rotate response: ${JSON.stringify(data)}`);
+    return data;
+}
+
+app.get('/change_seed', (req, res) => {
+    console.log('[SEED] /change_seed request received — queuing...');
+    enqueueSeedRotate(() => rotateDuelSeed())
+        .then(data => {
+            res.json({ success: true, data });
+        })
+        .catch(err => {
+            console.error(`[SEED] Rotate failed: ${err.message}`);
+            res.status(500).json({ success: false, error: err.message });
+        });
 });
 
 // Route: get strategy status
