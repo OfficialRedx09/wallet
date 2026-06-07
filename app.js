@@ -144,8 +144,8 @@ let duelTokenRefreshing = null;
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Random trade delay 100 – 1000 ms — reduces bot-detection timing fingerprint
-const randomDelay = () => sleep(100 + Math.floor(Math.random() * 900));
+// Random trade delay 900 – 1000 ms — reduces bot-detection timing fingerprint
+const randomDelay = () => sleep(900 + Math.floor(Math.random() * 101));
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
@@ -230,13 +230,13 @@ const STRATEGY_DEFS = [
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
 ];
 // Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
-// Cycle: Strategy 1 (2 wins → ~$0.02) → Strategy 2 (5 wins → ~$0.07) →
-//        Strategy 3 (2 win  → ~$0.09) → Strategy 4 (1 win  → ~$0.10) → repeat
+// Cycle: Strategy 1 (2 wins → ~$0.02) → Strategy 2 (3 wins → ~$0.05) →
+//        Strategy 3 (3 win  → ~$0.08) → Strategy 4 (2 win  → ~$0.10) → repeat
 const COMPLEX_PHASES = [
     { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 2 },
-    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 5 },
-    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 2 },
-    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1 },
+    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 3 },
+    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 3 },
+    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 2 },
 ];
 
 function getMtgSequence(level) {
@@ -980,13 +980,8 @@ async function runStrategyTick(session, key) {
                 session.isRunning = false;
                 return;
             }
-            // Non-fatal API error — wait 60 s with countdown; scan position is preserved
-            pushEvent(session, { type: 'error', code: 'API_ERROR', message: 'API error — retrying scan in 60s', detail: r.error, action: 'Scan position preserved — waiting 60 seconds' });
-            for (let remaining = 60; remaining > 0; remaining -= 5) {
-                if (!session.isRunning) return;
-                pushEvent(session, { type: 'log', message: `  [${def.name}] API error — retrying in ${remaining}s...`, logType: 'warn' });
-                await sleep(5000);
-            }
+            // Non-fatal API error — log to console and retry next tick; scan position is preserved
+            pushEvent(session, { type: 'log', message: `  [${def.name}] API error (scan): ${r.error} — retrying next tick`, logType: 'warn' });
             return;
         }
         pushEvent(session, { type: 'statusBar', mtgStep: 0, amount: 0, result: r.isWin ? 'win' : 'loss' });
@@ -1040,12 +1035,7 @@ async function runStrategyTick(session, key) {
                 return;
             }
             // Non-fatal API error — betStep is NOT incremented so we retry the exact same bet
-            pushEvent(session, { type: 'error', code: 'API_ERROR', message: `Bet API error — retrying in 60s`, detail: `${r.error} | MTG Step ${step}/${seq.length} retained`, action: 'Waiting 60 seconds before retry...' });
-            for (let remaining = 60; remaining > 0; remaining -= 5) {
-                if (!session.isRunning) return;
-                pushEvent(session, { type: 'log', message: `  [${def.name}] API error — retrying in ${remaining}s (Step ${step}/${seq.length} retained)`, logType: 'warn' });
-                await sleep(5000);
-            }
+            pushEvent(session, { type: 'log', message: `  [${def.name}] API error (Step ${step}/${seq.length} retained): ${r.error} — retrying next tick`, logType: 'warn' });
             return; // betStep unchanged — next tick retries the exact same bet
         }
         session.totalTrades++;
@@ -1137,12 +1127,12 @@ async function startStrategyLoop(session) {
     // 2. Force MTG level 6
     // 3. Reset phase counters and start at Phase 1 (Strategy 1)
     if (session.complexMode) {
-        session.mtgLevel          = 6;
+        session.mtgLevel          = 7; // 7 steps → 0.00025·1·2·4·8·16·32·64 ratio
         session.complexPhaseIndex = 0;
         session.complexPhaseWins  = 0;
         session.activeKeys        = [COMPLEX_PHASES[0].strategyKey];
         STRATEGY_DEFS.forEach(d => { session.state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
-        pushEvent(session, { type: 'log', message: '[COMPLEX] MTG Level forced to 6. Rotating seed at session start...', logType: 'system' });
+        pushEvent(session, { type: 'log', message: '[COMPLEX] MTG Level forced to 7 (7-step sequence). Rotating seed at session start...', logType: 'system' });
         try {
             await rotateDuelSeed();
             pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — Phase 1: ${COMPLEX_PHASES[0].name} (${COMPLEX_PHASES[0].winsNeeded} wins target)`, logType: 'system' });
