@@ -60,7 +60,7 @@ const DUEL_TOKEN_URL    = "https://duel.com/api/v2/user/security/token";
 const DUEL_BET_URL      = "https://duel.com/api/v2/dice/bet";
 const BLOCKCHAIR_BASE   = "https://api.blockchair.com/litecoin";
 const DUEL_DEVICE_UUID  = process.env.DUEL_DEVICE_UUID  || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
-const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "duel=sCqw1cqvNng9J0A99iOrezQPK4c4LbZSpAEuNGrh; do_not_share_this_with_anyone_not_even_staff=4975939_HSz6LmrgSus3qCcGnjbCUueh4Qp55r93DAm4EaNwxy1lekZg2Sv2B5RE1gtM; cf_clearance=fOrtE9TNoPnxCGxIeGJfHvuKPt8i2hlZTQa_vJWPmVM-1780691376-1.2.1.1-D3IhI9XEARs0VQLjhRsLPZV9uja2Jm08LF0v3Uvx1S0VaDcMCqXPrPSTEq254BnP0ZPRYsij5U6IfRYATZJjBrDaGn2eebjVfd6DraH_1hTgb7ET6FllTn6sFxQTjLatfItEc5UJithCLExCEg4IqyrzI1IZz01RSTgrH_a9zxtR9krqAQa5ko6nnjrSVV7piek8DBE2Wp_GqlgeJAsNgQgZbXKa8FIzJcBDmyVPI2HbqiAq.7B1y9jpINCOfxT7TH5iKKKoYRfR_FM64dVeiUjy9lgcQI9FfqqhelFT08zg5kB0lZlMFY7NUzIIc2UjRfOdXkzyQvznVJwYVjYa_xVno1S7O3R461G8sqQbW7Mn5UOs4WjtSinpeAF9kuM17_IOa35EQKs0aeH33w.7ey4K.4Hyd0A4xH4jzUe8O2I; _sp_id.d35b=c754ce38-2a8f-4af7-8e2a-f7eec01bcc1b.1780527197.19.1780753397.1780724973.27892308-a6ae-4a31-a5fa-ef83209d5651.c7706afd-d1be-4530-b00b-62a92cd829d5.6eac7b4b-b899-4625-a40f-1b7974c5e2d8.1780753387392.5; __cf_bm=Xs6T_SQ.B9Ps0znoP8NHEFmE3x5tIuMqtyT.QyPDwxM-1780753394.9858382-1.0.1.1-PjXIEy.JmaTOQv6s5EgvuKRC0GVTflRhfVxr1AtDgaouzFOEOdCS3HNXjmpHojBADeNdDVjlKQ0JKklDheQhPv1PPzulIoip2tRJRC.TORGoJniTXlvuWz5.XTKIbBoT; env_class=blue";
+const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "_sp_ses.d35b=*; duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; env_class=blue; __cf_bm=VStC4zY6cE1KA3LiiKlkdGntPXUGmmpTrCeDvDpek4Q-1780793051.4816592-1.0.1.1-mAUAzG504OpcxaiYq7.M.kkZVJltBNfMeB0NYhsH7j_3LHwps9iNmBldo.MRaAXJMv7KbOXRra2_7fftHoRLiOfmwN3JaU_v4gEGYHJX7E_CQMnxCdjSYZaV6vBjLI8H; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.1.1780793058..6ea60967-0e40-4ad7-b68a-a0ed4ee85838..82d6b3cc-b57c-4085-8641-199b013583e8.1780793046753.9";
 
 // Core Lookup Maps
 const addressToUserId        = new Map();
@@ -69,6 +69,24 @@ const userSweepQueue         = new Map();
 const lastOnChainSats        = new Map(); // userId -> last polled on-chain sats (detects new deposits)
 const userAccumulatedBalance = new Map(); // userId -> lifetime accumulated LTC (never decreases after sweep)
 const strategySessions       = new Map(); // userId -> strategy session
+
+// ── Per-user Firebase balance lock — serialises concurrent R-M-W ops ─────────
+const _balanceLocks = new Map();
+function acquireBalanceLock(userId, fn) {
+    const prev = _balanceLocks.get(userId) || Promise.resolve();
+    const next = prev.then(() => fn(), () => fn()); // run fn regardless of prev outcome
+    _balanceLocks.set(userId, next.then(() => undefined, () => undefined));
+    return next;
+}
+
+// ── Global Duel bet serializer — one bet at a time across all users ───────────
+// Prevents concurrent bets on the shared Duel account (token races, rate limits)
+let _duelBetQueue = Promise.resolve();
+function enqueueDuelBet(fn) {
+    const next = _duelBetQueue.then(() => fn(), () => fn());
+    _duelBetQueue = next.then(() => undefined, () => undefined);
+    return next;
+}
 
 // Duel token state
 let duelToken           = null;
@@ -92,7 +110,8 @@ const COMPLEX_BETS = [[0.00025, 0.0005, 0.00075], [0.0005, 0.001], [0.001, 0.001
 
 function getMtgSequence(level) {
     const seq = [0.00025];
-    for (let i = 0; i < level; i++) seq.push(+(seq[seq.length - 1] * 2).toFixed(8));
+    // level = exact number of bet steps: level 6 → 6 bets (indices 0-5)
+    for (let i = 1; i < level; i++) seq.push(+(seq[seq.length - 1] * 2).toFixed(8));
     return seq;
 }
 function getComplexBet(step, seq) {
@@ -135,17 +154,19 @@ async function getUserBalance(userId) {
 // Add delta (positive = win, negative = loss) to Balance and persist.
 // Returns new balance or null on DB error. Balance is floored at 0.
 async function adjustUserBalance(userId, delta) {
-    try {
-        const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
-        const current = parseFloat(snap.data?.Balance ?? 0) || 0;
-        const newBal  = Math.max(0, parseFloat((current + delta).toFixed(8)));
-        await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal });
-        console.log(`[BALANCE] ${userId}: ${current.toFixed(8)} ${delta >= 0 ? '+' : ''}${delta.toFixed(8)} → ${newBal.toFixed(8)} LTC`);
-        return newBal;
-    } catch (err) {
-        console.error(`[BALANCE] Failed to adjust balance for ${userId}: ${err.message}`);
-        return null;
-    }
+    return acquireBalanceLock(userId, async () => {
+        try {
+            const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+            const current = parseFloat(snap.data?.Balance ?? 0) || 0;
+            const newBal  = Math.max(0, parseFloat((current + delta).toFixed(8)));
+            await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal });
+            console.log(`[BALANCE] ${userId}: ${current.toFixed(8)} ${delta >= 0 ? '+' : ''}${delta.toFixed(8)} → ${newBal.toFixed(8)} LTC`);
+            return newBal;
+        } catch (err) {
+            console.error(`[BALANCE] Failed to adjust balance for ${userId}: ${err.message}`);
+            return null;
+        }
+    });
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -426,7 +447,14 @@ async function pollAllBalances() {
             lastOnChainSats.set(userId, currentSats);
             console.log(`[POLL] New deposit for ${userId}: +${depositLtc} LTC | Accumulated: ${newAccum} LTC`);
             try {
-                await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newAccum, AccumulatedBalance: newAccum });
+                // ADD deposit to existing Balance (preserves strategy P&L) and track AccumulatedBalance separately
+                await acquireBalanceLock(userId, async () => {
+                    const balSnap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+                    const currentBal = parseFloat(balSnap.data?.Balance ?? 0) || 0;
+                    const newBal = parseFloat((currentBal + depositLtc).toFixed(8));
+                    await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal, AccumulatedBalance: newAccum });
+                    console.log(`[POLL] Firebase balance for ${userId}: ${currentBal.toFixed(8)} +${depositLtc} → ${newBal.toFixed(8)} LTC`);
+                });
             } catch (e) { console.error(`[POLL] Firebase error for ${userId}: ${e.message}`); }
             if (!userSweepQueue.has(userId)) queueUserSweep(userId, () => sweepLtcToTreasury(userId));
         } else if (currentSats < prevSats) {
@@ -782,15 +810,17 @@ app.post('/duel-proxy', async (req, res) => {
 
 // ─── Strategy: Server-Side Execution ────────────────────────────────────────────
 async function placeDiceBet(amount) {
-    try {
-        const resp = await callDuelApi('post', DUEL_BET_URL, {
-            amount: String(amount), bet_type: 'over', currency: 104, target: '5005'
-        });
-        if (!resp?.success || !resp?.data?.round) return { success: false, error: resp?.message || 'Bet failed or no round data' };
-        return { success: true, isWin: resp.data.round.is_win, round: resp.data.round };
-    } catch (err) {
-        return { success: false, error: err.message };
-    }
+    return enqueueDuelBet(async () => {
+        try {
+            const resp = await callDuelApi('post', DUEL_BET_URL, {
+                amount: String(amount), bet_type: 'over', currency: 104, target: '5005'
+            });
+            if (!resp?.success || !resp?.data?.round) return { success: false, error: resp?.message || 'Bet failed or no round data' };
+            return { success: true, isWin: resp.data.round.is_win, round: resp.data.round };
+        } catch (err) {
+            return { success: false, error: err.message };
+        }
+    });
 }
 
 async function runStrategyTick(session, key) {
@@ -821,7 +851,13 @@ async function runStrategyTick(session, key) {
             state.lossStreak = 0;
         }
     } else {
-        const bet  = session.complexMode ? getComplexBet(state.betStep, seq) : (seq[state.betStep] ?? seq[seq.length - 1]);
+        // Guard: live MTG level change may have shortened seq below current betStep
+        if (state.betStep >= seq.length) {
+            pushEvent(session, { type: 'log', message: `  [${def.name}] MTG level changed mid-sequence — reset to waiting`, logType: 'warn' });
+            state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+            return;
+        }
+        const bet  = session.complexMode ? getComplexBet(state.betStep, seq) : seq[state.betStep];
         const step = state.betStep + 1;
 
         // ── Safety: check Firebase balance BEFORE placing any real bet ────────
@@ -1039,12 +1075,16 @@ async function handleLtcTx(tx) {
             console.log(`[DEPOSIT] ‼ User: ${userId} | +${amount} LTC | Accumulated: ${newAccum} LTC | TX: ${txHash}`);
             const ts = getDhakaTimestamp();
             try {
-                const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
-                if (snap.data) {
-                    await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, {
-                        Balance: newAccum, AccumulatedBalance: newAccum, date: ts.date, time: ts.time
-                    });
-                }
+                await acquireBalanceLock(userId, async () => {
+                    const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+                    if (snap.data) {
+                        const currentBal = parseFloat(snap.data.Balance ?? 0) || 0;
+                        const newBal = parseFloat((currentBal + amount).toFixed(8));
+                        await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, {
+                            Balance: newBal, AccumulatedBalance: newAccum, date: ts.date, time: ts.time
+                        });
+                    }
+                });
             } catch (e) { console.error(`[DEPOSIT] Firebase error for ${userId}: ${e.message}`); }
 
             queueUserSweep(userId, () => sweepLtcToTreasury(userId));
