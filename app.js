@@ -137,11 +137,11 @@ const STRATEGY_DEFS = [
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
 ];
 // Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
-// Cycle: Strategy 1 (5 wins → ~$0.05) → Strategy 2 (3 wins → ~$0.08) →
+// Cycle: Strategy 1 (3 wins → ~$0.03) → Strategy 2 (5 wins → ~$0.08) →
 //        Strategy 3 (1 win  → ~$0.09) → Strategy 4 (1 win  → ~$0.10) → repeat
 const COMPLEX_PHASES = [
-    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 5 },
-    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 3 },
+    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 3 },
+    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 5 },
     { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 1 },
     { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1 },
 ];
