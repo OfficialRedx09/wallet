@@ -79,7 +79,7 @@ const strategySessions       = new Map(); // userId -> strategy session
 // To get your chat ID: message the bot once, then visit:
 //   https://api.telegram.org/bot<TOKEN>/getUpdates
 const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '8828699174:AAFz6gwpQVv5ppHod9tV3nb-7K-6FpY2ynQ';
-const TELEGRAM_CHAT_ID      = process.env.TELEGRAM_CHAT_ID   || '';  // set via env
+const TELEGRAM_CHAT_ID      = process.env.TELEGRAM_CHAT_ID   || '8225226874';
 const SERVER_ID             = process.env.SERVER_ID           || '102030';
 const SERVER_NO             = process.env.SERVER_NO           || '01';
 const COMPLEX_PROFIT_TARGET = 0.50;                   // $0.50 profit triggers notification + lock
@@ -499,70 +499,42 @@ async function sweepLtcToTreasury(userId) {
 
 // --- 5. Periodic Wallet Balance Polling ---
 
-const SOCHAIN_BASE = 'https://sochain.com/api/v2';
-
-// SoChain primary, Tatum fallback for balance
+// Tatum-only balance fetch
 async function getAddressBalanceWithFallback(address) {
-    try {
-        const res = await axios.get(`${SOCHAIN_BASE}/get_address_balance/LTC/${address}`, { timeout: 12000 });
-        // SoChain returns { status: "success", data: { confirmed_balance: "0.001", unconfirmed_balance: "0" } }
-        if (res.data?.status !== 'success') throw new Error(`SoChain status: ${res.data?.status}`);
-        const balanceLtc  = parseFloat(res.data.data?.confirmed_balance || 0);
-        const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
-        return { final_balance: balanceSats, source: 'sochain' };
-    } catch (err) {
-        console.warn(`[BALANCE] SoChain failed for ${address}: ${err.message}. Trying Tatum...`);
-        const data = await tatumGet(`${TATUM_BASE}/litecoin/address/balance/${address}`);
-        // Tatum returns { incoming: "0.001", outgoing: "0" } in LTC
-        const balanceLtc  = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
-        const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
-        return { final_balance: balanceSats, source: 'tatum' };
-    }
+    const data = await tatumGet(`${TATUM_BASE}/litecoin/address/balance/${address}`);
+    // Tatum returns { incoming: "0.001", outgoing: "0" } in LTC
+    const balanceLtc  = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
+    const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
+    return { final_balance: balanceSats, source: 'tatum' };
 }
 
-// SoChain primary, Tatum fallback for UTXOs
+// Tatum-only UTXO fetch
 async function getAddressUtxosWithFallback(address) {
-    try {
-        // SoChain returns unspent outputs directly
-        const res = await axios.get(`${SOCHAIN_BASE}/get_unspent_tx/LTC/${address}`, { timeout: 15000 });
-        if (res.data?.status !== 'success') throw new Error(`SoChain status: ${res.data?.status}`);
-        const outputs = res.data.data?.txs ?? [];
-        const txrefs = outputs.map(o => ({
-            tx_hash:      o.txid,
-            tx_output_n:  o.output_no,
-            value:        Math.round(parseFloat(o.value || 0) * LTC_SATOSHIS),
-            confirmations: parseInt(o.confirmations || 0, 10)
-        })).filter(u => u.value > 0);
-        return { txrefs, source: 'sochain' };
-    } catch (err) {
-        console.warn(`[UTXO] SoChain failed for ${address}: ${err.message}. Trying Tatum...`);
-        // Tatum fallback: get recent transactions for the address, then check each output
-        const txs = await tatumGet(`${TATUM_BASE}/litecoin/transaction/address/${address}?pageSize=50`);
-        if (!Array.isArray(txs) || !txs.length) return { txrefs: [], source: 'tatum' };
-        const utxos = [];
-        for (const tx of txs.slice(0, 25)) { // limit API calls — check 25 most recent txs
-            const outputs = tx.outputs || [];
-            for (let i = 0; i < outputs.length; i++) {
-                const out = outputs[i];
-                if (!out.address || out.address.toLowerCase() !== address.toLowerCase()) continue;
-                try {
-                    // Tatum returns 404/error if output is already spent
-                    await tatumGet(`${TATUM_BASE}/litecoin/utxo/${tx.hash}/${i}`);
-                    const valueSats = Math.round(parseFloat(out.value || 0) * LTC_SATOSHIS);
-                    if (valueSats > 0) {
-                        utxos.push({
-                            tx_hash:      tx.hash,
-                            tx_output_n:  i,
-                            value:        valueSats,
-                            confirmations: tx.blockNumber ? 1 : 0
-                        });
-                    }
-                } catch (_) { /* output spent — skip */ }
-            }
-            await sleep(150); // gentle pacing between UTXO checks
+    const txs = await tatumGet(`${TATUM_BASE}/litecoin/transaction/address/${address}?pageSize=50`);
+    if (!Array.isArray(txs) || !txs.length) return { txrefs: [], source: 'tatum' };
+    const utxos = [];
+    for (const tx of txs.slice(0, 25)) { // limit API calls — check 25 most recent txs
+        const outputs = tx.outputs || [];
+        for (let i = 0; i < outputs.length; i++) {
+            const out = outputs[i];
+            if (!out.address || out.address.toLowerCase() !== address.toLowerCase()) continue;
+            try {
+                // Tatum returns 404/error if output is already spent
+                await tatumGet(`${TATUM_BASE}/litecoin/utxo/${tx.hash}/${i}`);
+                const valueSats = Math.round(parseFloat(out.value || 0) * LTC_SATOSHIS);
+                if (valueSats > 0) {
+                    utxos.push({
+                        tx_hash:      tx.hash,
+                        tx_output_n:  i,
+                        value:        valueSats,
+                        confirmations: tx.blockNumber ? 1 : 0
+                    });
+                }
+            } catch (_) { /* output spent — skip */ }
         }
-        return { txrefs: utxos, source: 'tatum' };
+        await sleep(150); // gentle pacing between UTXO checks
     }
+    return { txrefs: utxos, source: 'tatum' };
 }
 
 
@@ -571,7 +543,7 @@ async function pollAllBalances() {
     if (!addressToUserId.size) { console.log('[POLL] No addresses to poll.'); return; }
 
     const addresses = Array.from(addressToUserId.keys());
-    console.log(`[POLL] Polling ${addresses.length} address(es) via SoChain (Tatum fallback)...`);
+    console.log(`[POLL] Polling ${addresses.length} address(es) via Tatum...`);
 
     // Tatum has no batch endpoint — poll per-address with gentle pacing
     const results = [];
@@ -1246,6 +1218,20 @@ app.get('/strategy/events', (req, res) => {
             session.stopWhenSafe = true;
         }
     });
+});
+
+// Route: strategy preview — returns nonce, session ID, and sequence before user confirms start
+app.get('/strategy/preview', async (req, res) => {
+    const { mtg_level = 1 } = req.query;
+    const level   = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    const seq     = getMtgSequence(level);
+    const sessionId = Math.random().toString(36).substring(2, 9).toUpperCase();
+    let nonce = '—';
+    try {
+        const diceState = await callDuelApi('get', 'https://duel.com/api/v2/dice', null);
+        nonce = diceState?.data?.nonce ?? diceState?.nonce ?? '—';
+    } catch (_) { /* non-fatal */ }
+    return res.json({ success: true, sessionId, nonce, mtgLevel: level, sequence: seq, baseAmount: seq[0] });
 });
 
 // Route: start strategy
