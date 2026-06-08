@@ -38,7 +38,7 @@ app.use((req, res, next) => {
 
 // --- 2. Litecoin Network Setup ---
 const TATUM_BASE    = "https://api.tatum.io/v3";
-const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a2369afdf9fc562405f2f59-99d50ff6b7af4cd8ad781f3f";
+const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a27313caa620fad0caa1d3b-55c14747b32a46bea844dfcd";
 const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
 const LTC_SATOSHIS     = 1e8;   // 1 LTC = 100,000,000 satoshis
 const SWEEP_FEE_SATS   = 10000; // ~0.0001 LTC network fee
@@ -144,8 +144,8 @@ let duelTokenRefreshing = null;
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Random trade delay 900 – 1000 ms — reduces bot-detection timing fingerprint
-const randomDelay = () => sleep(900 + Math.floor(Math.random() * 101));
+// Random trade delay fixed at 500 ms
+const randomDelay = () => sleep(500);
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
@@ -201,6 +201,26 @@ async function sendTelegramMessage(chatId, text) {
     }
 }
 
+// Send a Telegram message every time a real bet is placed
+async function sendBetNotification(session, betAmount, isWin) {
+    if (!TELEGRAM_CHAT_ID) return;
+    const ts      = getDhakaTimestamp();
+    const bdtAmt  = (betAmount * LTC_TO_BDT_RATE).toFixed(2);
+    const msg = [
+        `🔰<b>SERVER ID</b> : ${SERVER_ID}`,
+        `📌<b>USER ID</b> : ${session.userId}`,
+        ``,
+        `<b>AMOUNT</b> : ${betAmount.toFixed(8)} LTC (${bdtAmt} BDT)`,
+        `<b>MTG LEVEL</b> : ${session.mtgLevel}`,
+        ``,
+        `<b>TRADE COUNT</b> : ${session.totalTrades}`,
+        ``,
+        `<b>DATE</b> : ${ts.date}`,
+        `<b>TIME</b> : ${ts.time} (+6 UTC)`,
+    ].join('\n');
+    sendTelegramMessage(TELEGRAM_CHAT_ID, msg).catch(e => console.error('[TELEGRAM-BET]', e.message));
+}
+
 // Build and send the complex-mode profit-target notification
 async function sendProfitTargetNotification(session, currentBalance) {
     const ts         = getDhakaTimestamp();
@@ -230,19 +250,26 @@ const STRATEGY_DEFS = [
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
 ];
 // Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
-// Cycle: Strategy 1 (2 wins → ~$0.02) → Strategy 2 (3 wins → ~$0.05) →
-//        Strategy 3 (3 win  → ~$0.08) → Strategy 4 (2 win  → ~$0.10) → repeat
+// Init (once): wait 7 consecutive under → Phase 1 (S1, 3 wins) → Phase 2 (S2, 2 wins) →
+//              Phase 3 (S3, 3 wins) → Phase 4 (S4, 1 win) → repeat from Phase 1 (no re-trigger)
 const COMPLEX_PHASES = [
-    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 2 },
-    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 3 },
+    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 3 },
+    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 2 },
     { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 3 },
-    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 2 },
+    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1 },
 ];
 
+// MTG sequence: 1·2·4·8·16·32·32·64·128·256… (32 is repeated once, then continues doubling)
 function getMtgSequence(level) {
-    const seq = [0.00025];
-    // level = exact number of bet steps: level 6 → 6 bets (indices 0-5)
-    for (let i = 1; i < level; i++) seq.push(+(seq[seq.length - 1] * 2).toFixed(8));
+    const BASE = 0.00025;
+    const seq  = [];
+    for (let i = 0; i < level; i++) {
+        let mult;
+        if (i <= 5)      mult = Math.pow(2, i);      // 1,2,4,8,16,32
+        else if (i === 6) mult = 32;                  // repeated 32
+        else             mult = Math.pow(2, i - 1);  // 64,128,256,…
+        seq.push(+(BASE * mult).toFixed(8));
+    }
     return seq;
 }
 function formatRound(r) {
@@ -259,7 +286,7 @@ function createSession(userId) {
     return {
         userId, isRunning: false, stopWhenSafe: false,
         activeKeys: [], mtgLevel: 1, complexMode: false,
-        complexPhaseIndex: 0, complexPhaseWins: 0,  // sequential-phase state for complex mode
+        complexPhaseIndex: 0, complexPhaseWins: 0, complexInitWaitDone: false,
         state, totalTrades: 0, totalProfit: 0, sseClients: new Set(),
         // Profit tracking & session metadata
         startBalance: null, sessionStartTime: Date.now(),
@@ -472,26 +499,44 @@ async function sweepLtcToTreasury(userId) {
 
 // --- 5. Periodic Wallet Balance Polling ---
 
-// Tatum primary, Blockchair fallback for balance
+const SOCHAIN_BASE = 'https://sochain.com/api/v2';
+
+// SoChain primary, Tatum fallback for balance
 async function getAddressBalanceWithFallback(address) {
     try {
+        const res = await axios.get(`${SOCHAIN_BASE}/get_address_balance/LTC/${address}`, { timeout: 12000 });
+        // SoChain returns { status: "success", data: { confirmed_balance: "0.001", unconfirmed_balance: "0" } }
+        if (res.data?.status !== 'success') throw new Error(`SoChain status: ${res.data?.status}`);
+        const balanceLtc  = parseFloat(res.data.data?.confirmed_balance || 0);
+        const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
+        return { final_balance: balanceSats, source: 'sochain' };
+    } catch (err) {
+        console.warn(`[BALANCE] SoChain failed for ${address}: ${err.message}. Trying Tatum...`);
         const data = await tatumGet(`${TATUM_BASE}/litecoin/address/balance/${address}`);
         // Tatum returns { incoming: "0.001", outgoing: "0" } in LTC
-        const balanceLtc = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
+        const balanceLtc  = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
         const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
         return { final_balance: balanceSats, source: 'tatum' };
-    } catch (err) {
-        console.warn(`[BALANCE] Tatum failed for ${address}: ${err.message}. Trying Blockchair...`);
-        const res = await axios.get(`${BLOCKCHAIR_BASE}/dashboards/address/${address}`, { timeout: 12000 });
-        const addrData = res.data?.data?.[address]?.address;
-        return { final_balance: parseInt(addrData?.balance ?? '0', 10) || 0, source: 'blockchair' };
     }
 }
 
-// Tatum primary, Blockchair fallback for UTXOs
+// SoChain primary, Tatum fallback for UTXOs
 async function getAddressUtxosWithFallback(address) {
     try {
-        // Get recent transactions for the address, then check each output
+        // SoChain returns unspent outputs directly
+        const res = await axios.get(`${SOCHAIN_BASE}/get_unspent_tx/LTC/${address}`, { timeout: 15000 });
+        if (res.data?.status !== 'success') throw new Error(`SoChain status: ${res.data?.status}`);
+        const outputs = res.data.data?.txs ?? [];
+        const txrefs = outputs.map(o => ({
+            tx_hash:      o.txid,
+            tx_output_n:  o.output_no,
+            value:        Math.round(parseFloat(o.value || 0) * LTC_SATOSHIS),
+            confirmations: parseInt(o.confirmations || 0, 10)
+        })).filter(u => u.value > 0);
+        return { txrefs, source: 'sochain' };
+    } catch (err) {
+        console.warn(`[UTXO] SoChain failed for ${address}: ${err.message}. Trying Tatum...`);
+        // Tatum fallback: get recent transactions for the address, then check each output
         const txs = await tatumGet(`${TATUM_BASE}/litecoin/transaction/address/${address}?pageSize=50`);
         if (!Array.isArray(txs) || !txs.length) return { txrefs: [], source: 'tatum' };
         const utxos = [];
@@ -517,19 +562,6 @@ async function getAddressUtxosWithFallback(address) {
             await sleep(150); // gentle pacing between UTXO checks
         }
         return { txrefs: utxos, source: 'tatum' };
-    } catch (err) {
-        console.warn(`[UTXO] Tatum failed for ${address}: ${err.message}. Trying Blockchair...`);
-        const res = await axios.get(
-            `${BLOCKCHAIR_BASE}/outputs?q=recipient(${address}),is_spent(false)&limit=100`,
-            { timeout: 15000 }
-        );
-        const txrefs = (res.data?.data ?? []).map(o => ({
-            tx_hash:      o.transaction_hash,
-            tx_output_n:  o.index,
-            value:        o.value,
-            confirmations: o.block_id ? 1 : 0
-        }));
-        return { txrefs, source: 'blockchair' };
     }
 }
 
@@ -539,7 +571,7 @@ async function pollAllBalances() {
     if (!addressToUserId.size) { console.log('[POLL] No addresses to poll.'); return; }
 
     const addresses = Array.from(addressToUserId.keys());
-    console.log(`[POLL] Polling ${addresses.length} address(es) via Tatum...`);
+    console.log(`[POLL] Polling ${addresses.length} address(es) via SoChain (Tatum fallback)...`);
 
     // Tatum has no batch endpoint — poll per-address with gentle pacing
     const results = [];
@@ -984,17 +1016,24 @@ async function runStrategyTick(session, key) {
             pushEvent(session, { type: 'log', message: `  [${def.name}] API error (scan): ${r.error} — retrying next tick`, logType: 'warn' });
             return;
         }
+        // In complex mode before the initial trigger, we require 7 consecutive under;
+        // otherwise use the strategy's own waitFor threshold.
+        const effectiveWaitFor = (session.complexMode && !session.complexInitWaitDone) ? 7 : def.waitFor;
         pushEvent(session, { type: 'statusBar', mtgStep: 0, amount: 0, result: r.isWin ? 'win' : 'loss' });
         if (!r.isWin) {
             state.lossStreak++;
-            pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (${state.lossStreak}/${def.waitFor}) — No Coin | ${formatRound(r.round)}`, logType: 'warn' });
+            pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (${state.lossStreak}/${effectiveWaitFor}) — No Coin | ${formatRound(r.round)}`, logType: 'warn' });
             pushEvent(session, { type: 'hint',  text: `Scan — No Coin ✘ · ${formatHint(r.round)}` });
-            if (state.lossStreak >= def.waitFor) {
+            if (state.lossStreak >= effectiveWaitFor) {
+                if (session.complexMode && !session.complexInitWaitDone) {
+                    session.complexInitWaitDone = true;
+                    pushEvent(session, { type: 'log', message: `[COMPLEX] ✔ 7 consecutive under detected — triggering Phase 1: ${COMPLEX_PHASES[0].name} (${COMPLEX_PHASES[0].winsNeeded} wins target)`, logType: 'system' });
+                }
                 state.phase = 'betting'; state.betStep = 0; state.lossStreak = 0;
-                pushEvent(session, { type: 'log', message: `  [${def.name}] Trigger! ${def.waitFor} scans — Mining START`, logType: 'system' });
+                pushEvent(session, { type: 'log', message: `  [${def.name}] Trigger! ${effectiveWaitFor} scans — Mining START`, logType: 'system' });
             }
         } else {
-            pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (0/${def.waitFor}) — Coin Found${state.lossStreak > 0 ? ', count reset' : ''} | ${formatRound(r.round)}`, logType: 'info' });
+            pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (0/${effectiveWaitFor}) — Coin Found${state.lossStreak > 0 ? ', count reset' : ''} | ${formatRound(r.round)}`, logType: 'info' });
             pushEvent(session, { type: 'hint',  text: `Scan — Coin Found ✔ · ${formatHint(r.round)}` });
             state.lossStreak = 0;
         }
@@ -1039,6 +1078,7 @@ async function runStrategyTick(session, key) {
             return; // betStep unchanged — next tick retries the exact same bet
         }
         session.totalTrades++;
+        sendBetNotification(session, bet, r.isWin);
         if (r.isWin) {
             session.totalProfit = +(session.totalProfit + bet).toFixed(8);
             pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'win' });
@@ -1124,18 +1164,18 @@ async function startStrategyLoop(session) {
 
     // ── Complex mode: one-time init at session start ────────────────────────
     // 1. Rotate seed once (non-fatal if it fails)
-    // 2. Force MTG level 6
-    // 3. Reset phase counters and start at Phase 1 (Strategy 1)
+    // 2. Use user-selected MTG level (not forced)
+    // 3. Reset phase counters; wait for 7 consecutive under before Phase 1
     if (session.complexMode) {
-        session.mtgLevel          = 7; // 7 steps → 0.00025·1·2·4·8·16·32·64 ratio
-        session.complexPhaseIndex = 0;
-        session.complexPhaseWins  = 0;
-        session.activeKeys        = [COMPLEX_PHASES[0].strategyKey];
+        session.complexPhaseIndex   = 0;
+        session.complexPhaseWins    = 0;
+        session.complexInitWaitDone = false; // must see 7 consecutive under first
+        session.activeKeys          = [COMPLEX_PHASES[0].strategyKey];
         STRATEGY_DEFS.forEach(d => { session.state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
-        pushEvent(session, { type: 'log', message: '[COMPLEX] MTG Level forced to 7 (7-step sequence). Rotating seed at session start...', logType: 'system' });
+        pushEvent(session, { type: 'log', message: `[COMPLEX] MTG Level: ${session.mtgLevel}. Rotating seed — then waiting for 7 consecutive under to trigger Phase 1...`, logType: 'system' });
         try {
             await rotateDuelSeed();
-            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — Phase 1: ${COMPLEX_PHASES[0].name} (${COMPLEX_PHASES[0].winsNeeded} wins target)`, logType: 'system' });
+            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — waiting for 7 consecutive under...`, logType: 'system' });
         } catch (seedErr) {
             pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotation failed (non-fatal): ${seedErr.message} — continuing`, logType: 'warn' });
         }
@@ -1238,7 +1278,7 @@ app.post('/strategy/start', (req, res) => {
     const session = strategySessions.get(user_id);
     if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
     session.activeKeys  = activeKeys;
-    session.mtgLevel    = isComplex ? 6 : Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    session.mtgLevel    = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
     session.complexMode = isComplex;
     session.totalTrades = 0;
     session.totalProfit = 0;
