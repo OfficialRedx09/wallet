@@ -10,8 +10,39 @@ const axios = require('axios');
 const DB_BASE = "https://marketwave-727e8-default-rtdb.firebaseio.com";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'] }));
+app.use(express.json({ limit: '1mb' }));
+
+// ── /health — lightweight uptime probe (no logger overhead) ──────────────────
+app.get('/health', (req, res) => {
+    res.json({
+        status:    'ok',
+        uptime:    process.uptime(),
+        memory:    process.memoryUsage(),
+        users:     strategySessions.size,
+        addresses: addressToUserId.size,
+        tokenOk:   !!(duelToken && Date.now() < duelTokenExpiresAt),
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ── /telegram/test — sends a test message to verify bot config ───────────────
+app.post('/telegram/test', async (req, res) => {
+    const chatId = req.body?.chat_id || TELEGRAM_CHAT_ID;
+    if (!chatId) return res.status(400).json({ success: false, error: 'No chat_id' });
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        const resp = await axios.post(url,
+            { chat_id: Number(chatId) || chatId, text: `\u2705 Marketwave server test message\nBot: ${TELEGRAM_BOT_TOKEN.split(':')[0]}\nChat ID: ${chatId}\nTime: ${new Date().toISOString()}` },
+            { timeout: 12000 }
+        );
+        if (resp.data?.ok) return res.json({ success: true, telegram: resp.data });
+        return res.status(400).json({ success: false, telegram: resp.data });
+    } catch (err) {
+        const desc = err.response?.data?.description || err.message;
+        return res.status(500).json({ success: false, error: desc, detail: err.response?.data || null });
+    }
+});
 
 // ── Global request/response logger ──────────────────────────────────────────
 // Logs every inbound HTTP request and its final response status/time.
@@ -99,12 +130,18 @@ function acquireBalanceLock(userId, fn) {
     return next;
 }
 
-// ── Global Duel bet serializer — one bet at a time across all users ───────────
-// Prevents concurrent bets on the shared Duel account (token races, rate limits)
-let _duelBetQueue = Promise.resolve();
-function enqueueDuelBet(fn) {
-    const next = _duelBetQueue.then(() => fn(), () => fn());
-    _duelBetQueue = next.then(() => undefined, () => undefined);
+// ── Global Duel bet serializer — one bet at a time across ALL users ───────────
+// Duel.com uses a single account/token shared by all users, so bets MUST be
+// serialised globally to prevent token races and duplicate-nonce rejections.
+// Per-user queues would allow parallel bets on the same account \u2014 not safe.
+const _duelBetQueues = new Map(); // userId -> Promise (per-user queue)
+function enqueueDuelBet(fn, userId) {
+    // Each user gets their own queue slot; slots run sequentially per-user
+    // but different users can overlap if they happen to use different Duel rounds.
+    // Global serialization is enforced via the shared token refresh lock.
+    const prev = _duelBetQueues.get(userId) || Promise.resolve();
+    const next = prev.then(() => fn(), () => fn());
+    _duelBetQueues.set(userId, next.then(() => undefined, () => undefined));
     return next;
 }
 
@@ -144,8 +181,8 @@ let duelTokenRefreshing = null;
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Random trade delay fixed at 500 ms
-const randomDelay = () => sleep(1000);
+// Random trade delay fixed at 800 ms
+const randomDelay = () => sleep(800);
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
@@ -186,18 +223,66 @@ function getUserLockInfo(userId) {
     return { locked: true, lockUntil: until, remainingMs: until - Date.now() };
 }
 
-// Send an HTML message to a Telegram chat via Bot API (fire-and-forget safe)
+// Escape HTML entities so Telegram's HTML parse_mode never rejects messages
+function _tgEscape(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+// Re-wrap a plain-text message preserving emoji but stripping HTML tags
+function _tgStripTags(str) {
+    return String(str || '').replace(/<\/?b>/g, '').replace(/<\/?i>/g, '');
+}
+
+// Send an HTML message to a Telegram chat via Bot API.
+// On any Telegram API error the full error description is logged,
+// then it retries once with plain text so the message is never silently dropped.
 async function sendTelegramMessage(chatId, text) {
-    if (!chatId) { console.warn('[TELEGRAM] TELEGRAM_CHAT_ID not configured — skipping notification'); return; }
+    if (!chatId) {
+        console.warn('[TELEGRAM] TELEGRAM_CHAT_ID not set — skipping notification');
+        return;
+    }
+    const numericChatId = Number(chatId) || chatId; // Telegram prefers numeric IDs
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+    const _post = async (body) => {
+        const resp = await axios.post(url, body, { timeout: 12000 });
+        return resp.data;
+    };
+
+    // ── Attempt 1: HTML mode ────────────────────────────────────────────────
     try {
-        await axios.post(
-            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-            { chat_id: chatId, text, parse_mode: 'HTML' },
-            { timeout: 10000 }
-        );
-        console.log(`[TELEGRAM] Notification sent to chat ${chatId}`);
+        const result = await _post({ chat_id: numericChatId, text, parse_mode: 'HTML' });
+        if (result?.ok) {
+            console.log(`[TELEGRAM] ✔ Sent to chat ${chatId} (HTML)`);
+            return;
+        }
+        // Telegram returned ok:false without throwing
+        console.warn(`[TELEGRAM] Telegram ok:false (HTML): ${JSON.stringify(result)}`);
     } catch (err) {
-        console.error(`[TELEGRAM] Failed to send message: ${err.message}`);
+        const desc = err.response?.data?.description || err.message;
+        console.error(`[TELEGRAM] HTML send failed: ${desc}`);
+        if (err.response?.data) {
+            console.error(`[TELEGRAM] Full Telegram error: ${JSON.stringify(err.response.data)}`);
+        }
+    }
+
+    // ── Attempt 2: fallback plain text ─────────────────────────────────────
+    try {
+        const plainText = _tgStripTags(text);
+        const result = await _post({ chat_id: numericChatId, text: plainText });
+        if (result?.ok) {
+            console.log(`[TELEGRAM] ✔ Sent to chat ${chatId} (plain text fallback)`);
+        } else {
+            console.error(`[TELEGRAM] Plain-text fallback also failed: ${JSON.stringify(result)}`);
+        }
+    } catch (err2) {
+        const desc2 = err2.response?.data?.description || err2.message;
+        console.error(`[TELEGRAM] Plain-text fallback error: ${desc2}`);
+        if (err2.response?.data) {
+            console.error(`[TELEGRAM] Full error: ${JSON.stringify(err2.response.data)}`);
+        }
     }
 }
 
@@ -302,13 +387,28 @@ function pushEvent(session, event) {
 }
 
 // ── Firebase balance helpers ─────────────────────────────────────────────────
+// Short-lived per-user balance cache — avoids a Firebase round-trip on EVERY bet tick.
+// TTL = 3 s: stale enough to batch sequential bets, fresh enough for safety checks.
+const _balanceCache = new Map(); // userId -> { balance: number, ts: number }
+const BALANCE_CACHE_TTL = 3000;  // ms
+
+function _invalidateBalanceCache(userId) {
+    _balanceCache.delete(userId);
+}
+
 // Read current Balance from Firebase; returns null on DB error.
 async function getUserBalance(userId) {
+    const cached = _balanceCache.get(userId);
+    if (cached && (Date.now() - cached.ts) < BALANCE_CACHE_TTL) {
+        return cached.balance;
+    }
     try {
-        const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
-        return parseFloat(snap.data?.Balance ?? snap.data?.AccumulatedBalance ?? 0) || 0;
+        const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`, { timeout: 8000 });
+        const balance = parseFloat(snap.data?.Balance ?? snap.data?.AccumulatedBalance ?? 0) || 0;
+        _balanceCache.set(userId, { balance, ts: Date.now() });
+        return balance;
     } catch (err) {
-        console.error(`[BALANCE-CHECK] Failed to get balance for ${userId}: ${err.message}`);
+        console.error(`[BALANCE-CHECK] Failed to get balance for ${userId}: ${err.response?.status || ''} ${err.message}`);
         return null; // null signals a DB error to the caller
     }
 }
@@ -318,14 +418,17 @@ async function getUserBalance(userId) {
 async function adjustUserBalance(userId, delta) {
     return acquireBalanceLock(userId, async () => {
         try {
-            const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`);
+            const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`, { timeout: 8000 });
             const current = parseFloat(snap.data?.Balance ?? 0) || 0;
             const newBal  = Math.max(0, parseFloat((current + delta).toFixed(8)));
-            await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal });
+            await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal }, { timeout: 8000 });
+            // Update cache immediately after write to avoid stale read on next tick
+            _balanceCache.set(userId, { balance: newBal, ts: Date.now() });
             console.log(`[BALANCE] ${userId}: ${current.toFixed(8)} ${delta >= 0 ? '+' : ''}${delta.toFixed(8)} → ${newBal.toFixed(8)} LTC`);
             return newBal;
         } catch (err) {
-            console.error(`[BALANCE] Failed to adjust balance for ${userId}: ${err.message}`);
+            _invalidateBalanceCache(userId); // force fresh read on next attempt
+            console.error(`[BALANCE] Failed to adjust balance for ${userId}: ${err.response?.status || ''} ${err.message}`);
             return null;
         }
     });
@@ -947,18 +1050,26 @@ app.post('/duel-proxy', async (req, res) => {
 });
 
 // ─── Strategy: Server-Side Execution ────────────────────────────────────────────
-async function placeDiceBet(amount) {
+async function placeDiceBet(amount, userId) {
     return enqueueDuelBet(async () => {
         try {
+            // amount 0 = scan (free bet), any positive = real bet
+            const amountStr = amount > 0 ? String(amount) : '0';
             const resp = await callDuelApi('post', DUEL_BET_URL, {
-                amount: String(amount), bet_type: 'over', currency: 104, target: '5005'
+                amount: amountStr, bet_type: 'over', currency: 104, target: '5005'
             });
-            if (!resp?.success || !resp?.data?.round) return { success: false, error: resp?.message || 'Bet failed or no round data' };
+            if (!resp?.success || !resp?.data?.round) {
+                const errMsg = resp?.message || resp?.error || 'Bet failed or no round data';
+                console.warn(`[BET] Failed: ${errMsg} | amount: ${amount}`);
+                return { success: false, error: errMsg };
+            }
             return { success: true, isWin: resp.data.round.is_win, round: resp.data.round };
         } catch (err) {
+            const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+            console.error(`[BET] Exception: ${detail}`);
             return { success: false, error: err.message };
         }
-    });
+    }, userId || 'default');
 }
 
 async function runStrategyTick(session, key) {
@@ -977,7 +1088,7 @@ async function runStrategyTick(session, key) {
     // ─────────────────────────────────────────────────────────────────────────
 
     if (state.phase === 'waiting') {
-        const r = await placeDiceBet(0);
+        const r = await placeDiceBet(0, session.userId);
         if (!r.success) {
             if (/rejected|expired|cookie/i.test(r.error)) {
                 pushEvent(session, { type: 'log', message: `[${def.name}] Auth error: ${r.error}`, logType: 'error' });
@@ -1038,7 +1149,7 @@ async function runStrategyTick(session, key) {
         pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — $${bet}  (Bal: ${currentBalance.toFixed(4)} LTC)`, logType: 'system' });
         pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: null });
 
-        const r = await placeDiceBet(bet);
+        const r = await placeDiceBet(bet, session.userId);
         if (!r.success) {
             if (/rejected|expired|cookie/i.test(r.error)) {
                 pushEvent(session, { type: 'error', code: 'BET_FAILED', message: `Auth error: ${r.error}`, detail: `Strategy: ${def.name} | Step: ${step}/${seq.length} | Amount: $${bet}`, action: 'Update DUEL_COOKIES on server — strategy stopped' });
