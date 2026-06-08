@@ -145,7 +145,7 @@ let duelTokenRefreshing = null;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Random trade delay fixed at 500 ms
-const randomDelay = () => sleep(600);
+const randomDelay = () => sleep(1000);
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
