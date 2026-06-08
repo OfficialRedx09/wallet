@@ -109,8 +109,22 @@ const strategySessions       = new Map(); // userId -> strategy session
 // Bot token is hard-coded; set TELEGRAM_CHAT_ID env var to your admin chat ID.
 // To get your chat ID: message the bot once, then visit:
 //   https://api.telegram.org/bot<TOKEN>/getUpdates
-const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '8828699174:AAFz6gwpQVv5ppHod9tV3nb-7K-6FpY2ynQ';
-const TELEGRAM_CHAT_ID      = process.env.TELEGRAM_CHAT_ID   || '8225226874';
+function getTelegramChatId() {
+    const envVal = process.env.TELEGRAM_CHAT_ID;
+    if (envVal && envVal.trim() !== '' && envVal !== 'null' && envVal !== 'undefined') {
+        return envVal.trim();
+    }
+    return '8225226874';
+}
+function getTelegramBotToken() {
+    const envVal = process.env.TELEGRAM_BOT_TOKEN;
+    if (envVal && envVal.trim() !== '' && envVal !== 'null' && envVal !== 'undefined') {
+        return envVal.trim();
+    }
+    return '8828699174:AAFz6gwpQVv5ppHod9tV3nb-7K-6FpY2ynQ';
+}
+const TELEGRAM_BOT_TOKEN    = getTelegramBotToken();
+const TELEGRAM_CHAT_ID      = getTelegramChatId();
 const SERVER_ID             = process.env.SERVER_ID           || '102030';
 const SERVER_NO             = process.env.SERVER_NO           || '01';
 const COMPLEX_PROFIT_TARGET = 0.50;                   // $0.50 profit triggers notification + lock
@@ -333,27 +347,28 @@ const STRATEGY_DEFS = [
     { key: 'momentum',  name: 'Strategy 4', waitFor: 6 },
     { key: 'grid',      name: 'Strategy 5', waitFor: 7 },
     { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
+    { key: 'complex0',  name: 'Phase 0',    waitFor: 7 },
 ];
 // Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
-// Init (once): wait 7 consecutive under → Phase 1 (S1, 3 wins) → Phase 2 (S2, 2 wins) →
-//              Phase 3 (S3, 3 wins) → Phase 4 (S4, 1 win) → repeat from Phase 1 (no re-trigger)
+// Phase 0 (once): wait 7 consecutive under, start betting with 0.01 LTC and martingale until win.
+// Strategy 1 (3 wins) → Strategy 2 (2 wins) → Strategy 3 (3 wins) → Strategy 4 (1 win) → loop back to Strategy 1
 const COMPLEX_PHASES = [
-    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 3 },
-    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 2 },
-    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 3 },
-    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1 },
+    { strategyKey: 'complex0',  name: 'Phase 0',    winsNeeded: 1, baseAmount: 0.01,    waitFor: 7 },
+    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 3, baseAmount: 0.00025, waitFor: 3 },
+    { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 2, baseAmount: 0.00025, waitFor: 4 },
+    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 3, baseAmount: 0.00025, waitFor: 5 },
+    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1, baseAmount: 0.00025, waitFor: 6 },
 ];
 
 // MTG sequence: 1·2·4·8·16·32·32·64·128·256… (32 is repeated once, then continues doubling)
-function getMtgSequence(level) {
-    const BASE = 0.00025;
+function getMtgSequence(level, base = 0.00025) {
     const seq  = [];
     for (let i = 0; i < level; i++) {
         let mult;
         if (i <= 5)      mult = Math.pow(2, i);      // 1,2,4,8,16,32
         else if (i === 6) mult = 32;                  // repeated 32
         else             mult = Math.pow(2, i - 1);  // 64,128,256,…
-        seq.push(+(BASE * mult).toFixed(8));
+        seq.push(+(base * mult).toFixed(8));
     }
     return seq;
 }
@@ -372,6 +387,7 @@ function createSession(userId) {
         userId, isRunning: false, stopWhenSafe: false,
         activeKeys: [], mtgLevel: 1, complexMode: false,
         complexPhaseIndex: 0, complexPhaseWins: 0, complexInitWaitDone: false,
+        waitingForStep4Confirmation: false, confirmedStep4: false,
         state, totalTrades: 0, totalProfit: 0, sseClients: new Set(),
         // Profit tracking & session metadata
         startBalance: null, sessionStartTime: Date.now(),
@@ -1076,7 +1092,16 @@ async function runStrategyTick(session, key) {
     const def   = STRATEGY_DEFS.find(d => d.key === key);
     if (!def) return;
     const state = session.state[key];
-    const seq   = getMtgSequence(session.mtgLevel);
+    
+    // Determine dynamic base amount based on active complex phase or standard default
+    let base = 0.00025;
+    if (session.complexMode) {
+        const curPhase = COMPLEX_PHASES[session.complexPhaseIndex];
+        if (curPhase && curPhase.strategyKey === key) {
+            base = curPhase.baseAmount;
+        }
+    }
+    const seq = getMtgSequence(session.mtgLevel, base);
 
     // ── Bet lock check — enforced for ALL bet types ───────────────────────────
     const lockInfo = getUserLockInfo(session.userId);
@@ -1099,19 +1124,13 @@ async function runStrategyTick(session, key) {
             pushEvent(session, { type: 'log', message: `  [${def.name}] API error (scan): ${r.error} — retrying next tick`, logType: 'warn' });
             return;
         }
-        // In complex mode before the initial trigger, we require 7 consecutive under;
-        // otherwise use the strategy's own waitFor threshold.
-        const effectiveWaitFor = (session.complexMode && !session.complexInitWaitDone) ? 7 : def.waitFor;
+        const effectiveWaitFor = def.waitFor;
         pushEvent(session, { type: 'statusBar', mtgStep: 0, amount: 0, result: r.isWin ? 'win' : 'loss' });
         if (!r.isWin) {
             state.lossStreak++;
             pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (${state.lossStreak}/${effectiveWaitFor}) — No Coin | ${formatRound(r.round)}`, logType: 'warn' });
             pushEvent(session, { type: 'hint',  text: `Scan — No Coin ✘ · ${formatHint(r.round)}` });
             if (state.lossStreak >= effectiveWaitFor) {
-                if (session.complexMode && !session.complexInitWaitDone) {
-                    session.complexInitWaitDone = true;
-                    pushEvent(session, { type: 'log', message: `[COMPLEX] ✔ 7 consecutive under detected — triggering Phase 1: ${COMPLEX_PHASES[0].name} (${COMPLEX_PHASES[0].winsNeeded} wins target)`, logType: 'system' });
-                }
                 state.phase = 'betting'; state.betStep = 0; state.lossStreak = 0;
                 pushEvent(session, { type: 'log', message: `  [${def.name}] Trigger! ${effectiveWaitFor} scans — Mining START`, logType: 'system' });
             }
@@ -1146,6 +1165,22 @@ async function runStrategyTick(session, key) {
         }
         // ─────────────────────────────────────────────────────────────────────
 
+        // ── Confirmation warning on Step 4 ───────────────────────────────────
+        if (step === 4 && !session.confirmedStep4) {
+            session.waitingForStep4Confirmation = true;
+            pushEvent(session, { type: 'confirm_step_4', step: 4, amount: bet });
+            pushEvent(session, { type: 'log', message: `[WARNING] MTG Step 4 reached. Waiting for client confirmation to proceed...`, logType: 'warn' });
+            
+            while (session.waitingForStep4Confirmation && session.isRunning) {
+                await sleep(500);
+            }
+            
+            if (!session.isRunning || session.waitingForStep4Confirmation) {
+                return;
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — $${bet}  (Bal: ${currentBalance.toFixed(4)} LTC)`, logType: 'system' });
         pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: null });
 
@@ -1172,21 +1207,24 @@ async function runStrategyTick(session, key) {
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: bet });
             // ────────────────────────────────────────────────────────────────
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+            session.confirmedStep4 = false; // Reset confirmation for next MTG cycle
+            
             // ── Complex mode: count wins, advance phase, check profit target ─
             if (session.complexMode) {
                 session.complexPhaseWins++;
                 const completedIdx = session.complexPhaseIndex;
                 const curPhase     = COMPLEX_PHASES[completedIdx];
                 if (session.complexPhaseWins >= curPhase.winsNeeded) {
-                    const nextIdx   = (completedIdx + 1) % COMPLEX_PHASES.length;
+                    // Loop but skip Phase 0 (index 0) on wrap around (completedIdx is index 4, next is index 1)
+                    const nextIdx   = (completedIdx === COMPLEX_PHASES.length - 1) ? 1 : completedIdx + 1;
                     const nextPhase = COMPLEX_PHASES[nextIdx];
-                    const cycleMsg  = nextIdx === 0 ? ' — cycle complete, restarting' : '';
+                    const cycleMsg  = nextIdx === 1 && completedIdx === COMPLEX_PHASES.length - 1 ? ' — cycle complete, restarting' : '';
                     session.complexPhaseIndex = nextIdx;
                     session.complexPhaseWins  = 0;
                     session.activeKeys        = [nextPhase.strategyKey];
                     session.state[nextPhase.strategyKey] = { phase: 'waiting', lossStreak: 0, betStep: 0 };
-                    pushEvent(session, { type: 'log', message: `[COMPLEX] ✔ Phase ${completedIdx + 1}/${COMPLEX_PHASES.length} done${cycleMsg} → ${nextPhase.name} (${nextPhase.winsNeeded} win${nextPhase.winsNeeded > 1 ? 's' : ''} target)`, logType: 'system' });
-                    pushEvent(session, { type: 'hint',  text: `Phase ${completedIdx + 1} done → ${nextPhase.name}` });
+                    pushEvent(session, { type: 'log', message: `[COMPLEX] ✔ ${curPhase.name} done${cycleMsg} → ${nextPhase.name} (${nextPhase.winsNeeded} win${nextPhase.winsNeeded > 1 ? 's' : ''} target)`, logType: 'system' });
+                    pushEvent(session, { type: 'hint',  text: `${curPhase.name} done → ${nextPhase.name}` });
                 } else {
                     pushEvent(session, { type: 'log', message: `[COMPLEX] Win ${session.complexPhaseWins}/${curPhase.winsNeeded} in ${curPhase.name}`, logType: 'info' });
                 }
@@ -1224,6 +1262,7 @@ async function runStrategyTick(session, key) {
             if (state.betStep >= seq.length) {
                 pushEvent(session, { type: 'log', message: `  [${def.name}] Limit (Level ${session.mtgLevel}) reached — reset`, logType: 'warn' });
                 state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+                session.confirmedStep4 = false; // Reset confirmation for next MTG cycle
             }
         }
         pushEvent(session, { type: 'stats', totalTrades: session.totalTrades, totalProfit: session.totalProfit });
@@ -1246,26 +1285,27 @@ async function startStrategyLoop(session) {
     // ─────────────────────────────────────────────────────────────────────────
 
     // ── Complex mode: one-time init at session start ────────────────────────
-    // 1. Rotate seed once (non-fatal if it fails)
-    // 2. Use user-selected MTG level (not forced)
-    // 3. Reset phase counters; wait for 7 consecutive under before Phase 1
+    // 1. Rotate seed once via the rate-limited queue
+    // 2. Start at Phase 0
     if (session.complexMode) {
         session.complexPhaseIndex   = 0;
         session.complexPhaseWins    = 0;
-        session.complexInitWaitDone = false; // must see 7 consecutive under first
         session.activeKeys          = [COMPLEX_PHASES[0].strategyKey];
+        session.confirmedStep4      = false;
+        session.waitingForStep4Confirmation = false;
         STRATEGY_DEFS.forEach(d => { session.state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
-        pushEvent(session, { type: 'log', message: `[COMPLEX] MTG Level: ${session.mtgLevel}. Rotating seed — then waiting for 7 consecutive under to trigger Phase 1...`, logType: 'system' });
+        pushEvent(session, { type: 'log', message: `[COMPLEX] MTG Level: ${session.mtgLevel}. Rotating seed...`, logType: 'system' });
         try {
-            await rotateDuelSeed();
-            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — waiting for 7 consecutive under...`, logType: 'system' });
+            await enqueueSeedRotate(() => rotateDuelSeed());
+            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — starting Phase 0 (waiting for 7 consecutive losses)...`, logType: 'system' });
         } catch (seedErr) {
-            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotation failed (non-fatal): ${seedErr.message} — continuing`, logType: 'warn' });
+            pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotation failed (non-fatal): ${seedErr.message} — starting Phase 0`, logType: 'warn' });
         }
     }
     // ────────────────────────────────────────────────────────────────────────
 
-    const seq = getMtgSequence(session.mtgLevel);
+    const startBase = session.complexMode ? COMPLEX_PHASES[0].baseAmount : 0.00025;
+    const seq = getMtgSequence(session.mtgLevel, startBase);
     pushEvent(session, { type: 'started', mtgLevel: session.mtgLevel, complexMode: session.complexMode, strategies: session.activeKeys, sequence: seq });
     try {
         while (session.isRunning) {
@@ -1353,7 +1393,7 @@ app.post('/strategy/start', (req, res) => {
     const isComplex = !!complex_mode;
     let activeKeys;
     if (isComplex) {
-        // Complex mode overrides strategy selection — always starts at Phase 1
+        // Complex mode overrides strategy selection — always starts at Phase 0
         activeKeys = [COMPLEX_PHASES[0].strategyKey];
     } else {
         if (!strategies?.length) return res.status(400).json({ success: false, error: 'strategies[] required' });
@@ -1385,7 +1425,8 @@ app.post('/strategy/start', (req, res) => {
         pushEvent(session, { type: 'error', message: err.message });
     });
     console.log(`[STRATEGY] Started for ${user_id} | keys:${activeKeys} level:${session.mtgLevel} complex:${session.complexMode}`);
-    return res.json({ success: true, strategies: activeKeys, mtgLevel: session.mtgLevel, complexMode: session.complexMode, sequence: getMtgSequence(session.mtgLevel) });
+    const startBase = isComplex ? COMPLEX_PHASES[0].baseAmount : 0.00025;
+    return res.json({ success: true, strategies: activeKeys, mtgLevel: session.mtgLevel, complexMode: session.complexMode, sequence: getMtgSequence(session.mtgLevel, startBase) });
 });
 
 // Route: check 20-hour bet lock status
@@ -1410,8 +1451,26 @@ app.post('/strategy/stop', (req, res) => {
     const session = strategySessions.get(user_id);
     if (!session?.isRunning) return res.json({ success: true, message: 'Was not running' });
     session.isRunning = false;
+    session.waitingForStep4Confirmation = false; // clear warning pause too
     console.log(`[STRATEGY] Stop signal for ${user_id}`);
     return res.json({ success: true, message: 'Stop signal sent' });
+});
+
+// Route: confirm MTG Step 4
+app.post('/strategy/confirm-step-4', (req, res) => {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
+    const session = strategySessions.get(user_id);
+    if (!session) return res.status(404).json({ success: false, error: 'Session not found' });
+    
+    if (session.waitingForStep4Confirmation) {
+        session.confirmedStep4 = true;
+        session.waitingForStep4Confirmation = false;
+        console.log(`[CONFIRM] User ${user_id} confirmed MTG Step 4.`);
+        pushEvent(session, { type: 'log', message: `[CONFIRM] Client confirmed Step 4 — proceeding with bet.`, logType: 'system' });
+        return res.json({ success: true, message: 'Step 4 confirmed' });
+    }
+    return res.json({ success: true, message: 'No confirmation pending' });
 });
 
 // Route: live-update strategy settings
@@ -1602,6 +1661,12 @@ async function loadAccounts() {
 console.log("[BOOT] Marketwave LTC Server starting...");
 loadAccounts().then(() => {
     console.log(`[BOOT] Account load complete. ${addressToUserId.size} address(es) registered. Tatum API ready.`);
+
+    // Test Telegram connection on boot
+    console.log("[BOOT] Testing Telegram notification bot...");
+    sendTelegramMessage(TELEGRAM_CHAT_ID, `🚀 <b>Marketwave Server Started</b>\nServer ID: ${SERVER_ID}\nServer No: ${SERVER_NO}\nTime: ${new Date().toISOString()}`)
+        .then(() => console.log("[BOOT] Telegram test message sent successfully."))
+        .catch(err => console.error("[BOOT] Telegram test message failed:", err.message));
 
     // Fetch a fresh Duel token on every boot — never rely on a cached/hardcoded value.
     // Auto-refresh fires every 590 s to stay ahead of the 600 s expiry.
