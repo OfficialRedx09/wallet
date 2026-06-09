@@ -16,12 +16,12 @@ app.use(express.json({ limit: '1mb' }));
 // ── /health — lightweight uptime probe (no logger overhead) ──────────────────
 app.get('/health', (req, res) => {
     res.json({
-        status:    'ok',
-        uptime:    process.uptime(),
-        memory:    process.memoryUsage(),
-        users:     strategySessions.size,
+        status: 'ok',
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        users: strategySessions.size,
         addresses: addressToUserId.size,
-        tokenOk:   !!(duelToken && Date.now() < duelTokenExpiresAt),
+        tokenOk: !!(duelToken && Date.now() < duelTokenExpiresAt),
         timestamp: new Date().toISOString()
     });
 });
@@ -48,7 +48,7 @@ app.post('/telegram/test', async (req, res) => {
 // Logs every inbound HTTP request and its final response status/time.
 app.use((req, res, next) => {
     const start = Date.now();
-    const ip    = req.headers['x-forwarded-for'] || req.ip;
+    const ip = req.headers['x-forwarded-for'] || req.ip;
     console.log(`\n[HTTP] ► ${req.method} ${req.originalUrl} | IP: ${ip}`);
     if (req.body && Object.keys(req.body).length > 0) {
         // Redact no sensitive fields here — full visibility requested
@@ -57,7 +57,7 @@ app.use((req, res, next) => {
     if (Object.keys(req.query).length > 0) {
         console.log(`[HTTP]   Query: ${JSON.stringify(req.query)}`);
     }
-    const origJson  = res.json.bind(res);
+    const origJson = res.json.bind(res);
     res.json = (data) => {
         const ms = Date.now() - start;
         console.log(`[HTTP] ◄ ${req.method} ${req.originalUrl} | Status: ${res.statusCode} | ${ms}ms | Response: ${JSON.stringify(data)}`);
@@ -68,11 +68,11 @@ app.use((req, res, next) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // --- 2. Litecoin Network Setup ---
-const TATUM_BASE    = "https://api.tatum.io/v3";
+const TATUM_BASE = "https://api.tatum.io/v3";
 const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a27313caa620fad0caa1d3b-55c14747b32a46bea844dfcd";
 const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
-const LTC_SATOSHIS     = 1e8;   // 1 LTC = 100,000,000 satoshis
-const SWEEP_FEE_SATS   = 10000; // ~0.0001 LTC network fee
+const LTC_SATOSHIS = 1e8;   // 1 LTC = 100,000,000 satoshis
+const SWEEP_FEE_SATS = 10000; // ~0.0001 LTC network fee
 
 const bip32 = BIP32Factory(ecc);
 
@@ -87,23 +87,23 @@ const LITECOIN_NETWORK = {
 };
 
 // --- Duel.com Token Config ---
-const DUEL_TOKEN_URL    = "https://duel.com/api/v2/user/security/token";
-const DUEL_BET_URL      = "https://duel.com/api/v2/dice/bet";
-const BLOCKCHAIR_BASE   = "https://api.blockchair.com/litecoin";
+const DUEL_TOKEN_URL = "https://duel.com/api/v2/user/security/token";
+const DUEL_BET_URL = "https://duel.com/api/v2/dice/bet";
+const BLOCKCHAIR_BASE = "https://api.blockchair.com/litecoin";
 const DUEL_SEED_ROTATE_URL = "https://duel.com/api/v2/client-seed/rotate";
-const DUEL_DEVICE_UUID  = process.env.DUEL_DEVICE_UUID  || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
+const DUEL_DEVICE_UUID = process.env.DUEL_DEVICE_UUID || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
 // Mobile session cookies — used for all betting calls
-const DUEL_COOKIES      = process.env.DUEL_COOKIES      || "_sp_ses.d35b=*; duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; env_class=blue; __cf_bm=VStC4zY6cE1KA3LiiKlkdGntPXUGmmpTrCeDvDpek4Q-1780793051.4816592-1.0.1.1-mAUAzG504OpcxaiYq7.M.kkZVJltBNfMeB0NYhsH7j_3LHwps9iNmBldo.MRaAXJMv7KbOXRra2_7fftHoRLiOfmwN3JaU_v4gEGYHJX7E_CQMnxCdjSYZaV6vBjLI8H; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.1.1780793058..6ea60967-0e40-4ad7-b68a-a0ed4ee85838..82d6b3cc-b57c-4085-8641-199b013583e8.1780793046753.9";
+const DUEL_COOKIES = process.env.DUEL_COOKIES || "_sp_ses.d35b=*; duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; env_class=blue; __cf_bm=VStC4zY6cE1KA3LiiKlkdGntPXUGmmpTrCeDvDpek4Q-1780793051.4816592-1.0.1.1-mAUAzG504OpcxaiYq7.M.kkZVJltBNfMeB0NYhsH7j_3LHwps9iNmBldo.MRaAXJMv7KbOXRra2_7fftHoRLiOfmwN3JaU_v4gEGYHJX7E_CQMnxCdjSYZaV6vBjLI8H; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.1.1780793058..6ea60967-0e40-4ad7-b68a-a0ed4ee85838..82d6b3cc-b57c-4085-8641-199b013583e8.1780793046753.9";
 // Desktop session cookies — used exclusively for seed rotation (separate cf_clearance)
 const DUEL_SEED_COOKIES = process.env.DUEL_SEED_COOKIES || "duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; _sp_ses.d35b=*; cf_clearance=0azt0u7AEb9PL9puC_mtGV.4UsNlBFXB8PlRG8IVaUw-1780797543-1.2.1.1-afHmObdO4TvSjFxk8R7zyuMtFVvrdc8jLvL0kE5scoWaY.LV2C5lr3mEvZ2jicGm5StD65cxcprimS99mmKBhIXtLQQf_VpG0.Bm4piZKRFfRxuGuzq7jIXZ.NOUmNHIOLLUk8NEyca03hXhAfI8Vn9nIO_aVIt_VYvlaexoNcKYRcbabJumntBTokCQr9LT4ihTPU67DaFpyC3hokty9Qj4ptvI4k5wRN6GpUQfgly0xBhhU_vcdrWCsTHWVUZGhl8g.McFtZlp6iqz.vkYCVpER3.DGrjuR1kAnY1MaIAAnsOM6FwH1x.m9ospNj.3CJK9.3HDEu1eNLma9MHrcxBDz9h5hQy.oFBadZHDyxcb1pxKumuk4sPx5nli.xLO0Q1IC9h_5YflcpVGzWS6kMkkTILOpXKksEbS6iuwpGM; __cf_bm=caQj4DVoVqRW4VAjDqT_i1UdIXzdf9ol4ARiI8vq2e0-1780797546.326099-1.0.1.1-Ii960dRYm7J6eFwWzdUP4f8pf1KEVBE2c8bnd50ceuE8JM_KvvfrgVyrZ2BX2cGG03Qosw_92FBJmA9QamOHsie67yauty6JEde4f7B1nLvUuvp3ofjTk1SOH7rfeztH; env_class=blue; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.2.1780797752.1780795546.5a59b211-7504-4443-be44-d171383b4fce.6ea60967-0e40-4ad7-b68a-a0ed4ee85838.1227487e-b463-4bda-a7d5-89c55b46d832.1780797472489.72";
 
 // Core Lookup Maps
-const addressToUserId        = new Map();
-const userIdToPhrase         = new Map();
-const userSweepQueue         = new Map();
-const lastOnChainSats        = new Map(); // userId -> last polled on-chain sats (detects new deposits)
+const addressToUserId = new Map();
+const userIdToPhrase = new Map();
+const userSweepQueue = new Map();
+const lastOnChainSats = new Map(); // userId -> last polled on-chain sats (detects new deposits)
 const userAccumulatedBalance = new Map(); // userId -> lifetime accumulated LTC (never decreases after sweep)
-const strategySessions       = new Map(); // userId -> strategy session
+const strategySessions = new Map(); // userId -> strategy session
 
 // ── Telegram notification config ──────────────────────────────────────────────
 // Bot token is hard-coded; set TELEGRAM_CHAT_ID env var to your admin chat ID.
@@ -123,16 +123,16 @@ function getTelegramBotToken() {
     }
     return '8828699174:AAFz6gwpQVv5ppHod9tV3nb-7K-6FpY2ynQ';
 }
-const TELEGRAM_BOT_TOKEN    = getTelegramBotToken();
-const TELEGRAM_CHAT_ID      = getTelegramChatId();
-const SERVER_ID             = process.env.SERVER_ID           || '102030';
-const SERVER_NO             = process.env.SERVER_NO           || '01';
+const TELEGRAM_BOT_TOKEN = getTelegramBotToken();
+const TELEGRAM_CHAT_ID = getTelegramChatId();
+const SERVER_ID = process.env.SERVER_ID || '102030';
+const SERVER_NO = process.env.SERVER_NO || '01';
 const COMPLEX_PROFIT_TARGET = 0.50;                   // $0.50 profit triggers notification + lock
-const LTC_TO_BDT_RATE       = 5000;                   // 1 LTC ≈ 5000 BDT  (balance / 0.00025 × 1.25)
+const LTC_TO_BDT_RATE = 5000;                   // 1 LTC ≈ 5000 BDT  (balance / 0.00025 × 1.25)
 const USER_LOCK_DURATION_MS = 20 * 60 * 60 * 1000;   // 20 hours in ms
 
 // Per-user bet lock — user cannot trade for 20 h after complex-mode profit target is hit
-const userBetLocks          = new Map(); // userId -> lockUntilTimestamp (ms epoch)
+const userBetLocks = new Map(); // userId -> lockUntilTimestamp (ms epoch)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Per-user Firebase balance lock — serialises concurrent R-M-W ops ─────────
@@ -162,7 +162,7 @@ function enqueueDuelBet(fn, userId) {
 // ── Seed rotation rate limiter — max 1 call per 60 s ─────────────────────────
 // Queued requests wait for the next available 60 s window before executing.
 let _lastSeedRotateAt = 0;
-let _seedRotateQueue  = Promise.resolve();
+let _seedRotateQueue = Promise.resolve();
 function enqueueSeedRotate(fn) {
     const next = _seedRotateQueue.then(
         async () => {
@@ -186,8 +186,8 @@ function enqueueSeedRotate(fn) {
 }
 
 // Duel token state
-let duelToken           = null;
-let duelTokenExpiresAt  = 0;
+let duelToken = null;
+let duelTokenExpiresAt = 0;
 let duelTokenRefreshing = null;
 
 
@@ -211,10 +211,10 @@ const _ACCEPT_LANGS = [
 ];
 function _randomBetHeaders() {
     return {
-        'user-agent':      _MOBILE_UAS[Math.floor(Math.random() * _MOBILE_UAS.length)],
+        'user-agent': _MOBILE_UAS[Math.floor(Math.random() * _MOBILE_UAS.length)],
         'accept-language': _ACCEPT_LANGS[Math.floor(Math.random() * _ACCEPT_LANGS.length)],
-        'priority':        Math.random() > 0.6 ? 'u=1, i' : 'u=3, i',
-        'sec-gpc':         Math.random() > 0.3 ? '1' : '0',
+        'priority': Math.random() > 0.6 ? 'u=1, i' : 'u=3, i',
+        'sec-gpc': Math.random() > 0.3 ? '1' : '0',
     };
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,8 +303,8 @@ async function sendTelegramMessage(chatId, text) {
 // Send a Telegram message every time a real bet is placed
 async function sendBetNotification(session, betAmount, isWin) {
     if (!TELEGRAM_CHAT_ID) return;
-    const ts      = getDhakaTimestamp();
-    const bdtAmt  = (betAmount * LTC_TO_BDT_RATE).toFixed(2);
+    const ts = getDhakaTimestamp();
+    const bdtAmt = (betAmount * LTC_TO_BDT_RATE).toFixed(2);
     const msg = [
         `🔰<b>SERVER ID</b> : ${SERVER_ID}`,
         `📌<b>USER ID</b> : ${session.userId}`,
@@ -322,11 +322,11 @@ async function sendBetNotification(session, betAmount, isWin) {
 
 // Build and send the complex-mode profit-target notification
 async function sendProfitTargetNotification(session, currentBalance) {
-    const ts         = getDhakaTimestamp();
-    const runtimeMs  = Date.now() - (session.sessionStartTime || Date.now());
+    const ts = getDhakaTimestamp();
+    const runtimeMs = Date.now() - (session.sessionStartTime || Date.now());
     const runtimeStr = formatDuration(runtimeMs);
-    const bdtStr     = (currentBalance * LTC_TO_BDT_RATE).toFixed(2);
-    const maxMtg     = session.maxMtgStepReached || 0;
+    const bdtStr = (currentBalance * LTC_TO_BDT_RATE).toFixed(2);
+    const maxMtg = session.maxMtgStepReached || 0;
     const msg = [
         `🔰<b>Server ID</b> : ${SERVER_ID}`,
         `<b>Server No</b> : ${SERVER_NO}`,
@@ -341,33 +341,33 @@ async function sendProfitTargetNotification(session, currentBalance) {
 }
 
 const STRATEGY_DEFS = [
-    { key: 'scalp',     name: 'Strategy 1', waitFor: 3 },
+    { key: 'scalp', name: 'Strategy 1', waitFor: 3 },
     { key: 'arbitrage', name: 'Strategy 2', waitFor: 4 },
-    { key: 'dca',       name: 'Strategy 3', waitFor: 5 },
-    { key: 'momentum',  name: 'Strategy 4', waitFor: 6 },
-    { key: 'grid',      name: 'Strategy 5', waitFor: 7 },
-    { key: 'safe',      name: 'Strategy 6', waitFor: 8 },
-    { key: 'complex0',  name: 'Phase 0',    waitFor: 7 },
+    { key: 'dca', name: 'Strategy 3', waitFor: 5 },
+    { key: 'momentum', name: 'Strategy 4', waitFor: 6 },
+    { key: 'grid', name: 'Strategy 5', waitFor: 7 },
+    { key: 'safe', name: 'Strategy 6', waitFor: 8 },
+    { key: 'complex0', name: 'Phase 0', waitFor: 7 },
 ];
 // Complex mode: sequential phases — each phase runs one strategy until N wins, then advances.
 // Phase 0 (once): wait 7 consecutive under, start betting with 0.01 LTC and martingale until win.
 // Strategy 1 (3 wins) → Strategy 2 (2 wins) → Strategy 3 (3 wins) → Strategy 4 (1 win) → loop back to Strategy 1
 const COMPLEX_PHASES = [
-    { strategyKey: 'complex0',  name: 'Phase 0',    winsNeeded: 1, baseAmount: 0.01,    waitFor: 7 },
-    { strategyKey: 'scalp',     name: 'Strategy 1', winsNeeded: 3, baseAmount: 0.00025, waitFor: 3 },
+    { strategyKey: 'complex0', name: 'Phase 0', winsNeeded: 1, baseAmount: 0.00025, waitFor: 7 },
+    { strategyKey: 'scalp', name: 'Strategy 1', winsNeeded: 3, baseAmount: 0.00025, waitFor: 3 },
     { strategyKey: 'arbitrage', name: 'Strategy 2', winsNeeded: 2, baseAmount: 0.00025, waitFor: 4 },
-    { strategyKey: 'dca',       name: 'Strategy 3', winsNeeded: 3, baseAmount: 0.00025, waitFor: 5 },
-    { strategyKey: 'momentum',  name: 'Strategy 4', winsNeeded: 1, baseAmount: 0.00025, waitFor: 6 },
+    { strategyKey: 'dca', name: 'Strategy 3', winsNeeded: 3, baseAmount: 0.00025, waitFor: 5 },
+    { strategyKey: 'momentum', name: 'Strategy 4', winsNeeded: 1, baseAmount: 0.00025, waitFor: 6 },
 ];
 
 // MTG sequence: 1·2·4·8·16·32·32·64·128·256… (32 is repeated once, then continues doubling)
 function getMtgSequence(level, base = 0.00025) {
-    const seq  = [];
+    const seq = [];
     for (let i = 0; i < level; i++) {
         let mult;
-        if (i <= 5)      mult = Math.pow(2, i);      // 1,2,4,8,16,32
+        if (i <= 5) mult = Math.pow(2, i);      // 1,2,4,8,16,32
         else if (i === 6) mult = 32;                  // repeated 32
-        else             mult = Math.pow(2, i - 1);  // 64,128,256,…
+        else mult = Math.pow(2, i - 1);  // 64,128,256,…
         seq.push(+(base * mult).toFixed(8));
     }
     return seq;
@@ -419,7 +419,7 @@ async function getUserBalance(userId) {
         return cached.balance;
     }
     try {
-        const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`, { timeout: 8000 });
+        const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`, { timeout: 8000 });
         const balance = parseFloat(snap.data?.Balance ?? snap.data?.AccumulatedBalance ?? 0) || 0;
         _balanceCache.set(userId, { balance, ts: Date.now() });
         return balance;
@@ -434,9 +434,9 @@ async function getUserBalance(userId) {
 async function adjustUserBalance(userId, delta) {
     return acquireBalanceLock(userId, async () => {
         try {
-            const snap    = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`, { timeout: 8000 });
+            const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}.json`, { timeout: 8000 });
             const current = parseFloat(snap.data?.Balance ?? 0) || 0;
-            const newBal  = Math.max(0, parseFloat((current + delta).toFixed(8)));
+            const newBal = Math.max(0, parseFloat((current + delta).toFixed(8)));
             await axios.patch(`${DB_BASE}/crypto_accounts/${userId}.json`, { Balance: newBal }, { timeout: 8000 });
             // Update cache immediately after write to avoid stale read on next tick
             _balanceCache.set(userId, { balance: newBal, ts: Date.now() });
@@ -453,11 +453,11 @@ async function adjustUserBalance(userId, delta) {
 
 // Derive a native-segwit (bech32 ltc1...) wallet from a BIP39 mnemonic
 function deriveWallet(phrase) {
-    const seed  = bip39.mnemonicToSeedSync(phrase);
-    const root  = bip32.fromSeed(seed, LITECOIN_NETWORK);
+    const seed = bip39.mnemonicToSeedSync(phrase);
+    const root = bip32.fromSeed(seed, LITECOIN_NETWORK);
     const child = root.derivePath("m/84'/2'/0'/0/0");
     const p2wpkh = bitcoin.payments.p2wpkh({
-        pubkey:  Buffer.from(child.publicKey),
+        pubkey: Buffer.from(child.publicKey),
         network: LITECOIN_NETWORK
     });
     return { address: p2wpkh.address, child };
@@ -560,7 +560,7 @@ async function sweepLtcToTreasury(userId) {
         }
 
         const totalSatoshis = txrefs.reduce((sum, u) => sum + u.value, 0);
-        const sendSatoshis  = totalSatoshis - SWEEP_FEE_SATS;
+        const sendSatoshis = totalSatoshis - SWEEP_FEE_SATS;
 
         console.log(`[SWEEP] Total balance: ${(totalSatoshis / LTC_SATOSHIS).toFixed(8)} LTC | Fee: ${(SWEEP_FEE_SATS / LTC_SATOSHIS).toFixed(8)} LTC | Sending: ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC`);
 
@@ -573,7 +573,7 @@ async function sweepLtcToTreasury(userId) {
 
         // Build P2WPKH transaction
         const p2wpkh = bitcoin.payments.p2wpkh({
-            pubkey:  Buffer.from(child.publicKey),
+            pubkey: Buffer.from(child.publicKey),
             network: LITECOIN_NETWORK
         });
 
@@ -585,7 +585,7 @@ async function sweepLtcToTreasury(userId) {
                 index: utxo.tx_output_n,
                 witnessUtxo: {
                     script: p2wpkh.output,
-                    value:  utxo.value
+                    value: utxo.value
                 }
             });
             console.log(`[SWEEP] Input added: txid=${utxo.tx_hash} vout=${utxo.tx_output_n} value=${utxo.value} sats`);
@@ -622,7 +622,7 @@ async function sweepLtcToTreasury(userId) {
 async function getAddressBalanceWithFallback(address) {
     const data = await tatumGet(`${TATUM_BASE}/litecoin/address/balance/${address}`);
     // Tatum returns { incoming: "0.001", outgoing: "0" } in LTC
-    const balanceLtc  = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
+    const balanceLtc = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
     const balanceSats = Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS));
     return { final_balance: balanceSats, source: 'tatum' };
 }
@@ -643,9 +643,9 @@ async function getAddressUtxosWithFallback(address) {
                 const valueSats = Math.round(parseFloat(out.value || 0) * LTC_SATOSHIS);
                 if (valueSats > 0) {
                     utxos.push({
-                        tx_hash:      tx.hash,
-                        tx_output_n:  i,
-                        value:        valueSats,
+                        tx_hash: tx.hash,
+                        tx_output_n: i,
+                        value: valueSats,
                         confirmations: tx.blockNumber ? 1 : 0
                     });
                 }
@@ -684,7 +684,7 @@ async function pollAllBalances() {
         if (!userId) continue;
 
         const currentSats = item.final_balance ?? 0;
-        const prevSats    = lastOnChainSats.get(userId);
+        const prevSats = lastOnChainSats.get(userId);
 
         if (prevSats === undefined) {
             // First poll after boot: initialise baseline, don't treat existing balance as new deposit
@@ -699,8 +699,8 @@ async function pollAllBalances() {
         if (currentSats > prevSats) {
             // New deposit detected by poll
             const depositLtc = parseFloat(((currentSats - prevSats) / LTC_SATOSHIS).toFixed(8));
-            const prevAccum  = userAccumulatedBalance.get(userId) || 0;
-            const newAccum   = parseFloat((prevAccum + depositLtc).toFixed(8));
+            const prevAccum = userAccumulatedBalance.get(userId) || 0;
+            const newAccum = parseFloat((prevAccum + depositLtc).toFixed(8));
             userAccumulatedBalance.set(userId, newAccum);
             lastOnChainSats.set(userId, currentSats);
             console.log(`[POLL] New deposit for ${userId}: +${depositLtc} LTC | Accumulated: ${newAccum} LTC`);
@@ -746,14 +746,14 @@ function getDhakaTimestamp() {
 app.post('/create-account', async (req, res) => {
     try {
         const user_id = req.body.user_id || req.query.user_id;
-        const userIp  = req.body.ip || req.query.ip || req.ip;
+        const userIp = req.body.ip || req.query.ip || req.ip;
 
         if (!user_id) {
             return res.status(400).json({ error: "user_id parameter is required" });
         }
 
         const existingSnapshot = await axios.get(`${DB_BASE}/crypto_accounts/${user_id}.json`);
-        const existingAccount  = existingSnapshot.data;
+        const existingAccount = existingSnapshot.data;
 
         if (existingAccount) {
             let existingAddress = "";
@@ -785,21 +785,21 @@ app.post('/create-account', async (req, res) => {
 
         // Create new secure BIP39 wallet
         console.log(`[WALLET] Creating new LTC wallet for user ${user_id}...`);
-        const phrase  = bip39.generateMnemonic(256); // 24-word phrase
+        const phrase = bip39.generateMnemonic(256); // 24-word phrase
         const { address } = deriveWallet(phrase);
-        const timestamp   = getDhakaTimestamp();
+        const timestamp = getDhakaTimestamp();
         console.log(`[WALLET] New LTC wallet generated | Address: ${address} | User: ${user_id} | IP: ${userIp}`);
 
         const newAccountData = {
             User_id: user_id,
-            date:    timestamp.date,
-            time:    timestamp.time,
-            IP:      userIp,
+            date: timestamp.date,
+            time: timestamp.time,
+            IP: userIp,
             Balance: 0,
             AccumulatedBalance: 0,
             Address: address,
-            Key:     phrase,
-            Public:  address
+            Key: phrase,
+            Public: address
         };
 
         await axios.put(`${DB_BASE}/crypto_accounts/${user_id}.json`, newAccountData);
@@ -843,34 +843,34 @@ async function fetchDuelToken() {
                     {
                         responseType: 'text', // raw string so we can measure exact byte length
                         headers: {
-                            'accept':                      'application/json, text/plain, */*',
-                            'accept-encoding':             'gzip, deflate, br, zstd',
-                            'accept-language':             'en-GB,en;q=0.6',
-                            'content-type':                'application/json',
-                            'cookie':                      DUEL_COOKIES,
-                            'origin':                      'https://duel.com',
-                            'priority':                    'u=1, i',
-                            'referer':                     'https://duel.com/dice',
-                            'sec-ch-ua':                   '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                            'sec-ch-ua-arch':              '""',
-                            'sec-ch-ua-bitness':           '"64"',
+                            'accept': 'application/json, text/plain, */*',
+                            'accept-encoding': 'gzip, deflate, br, zstd',
+                            'accept-language': 'en-GB,en;q=0.6',
+                            'content-type': 'application/json',
+                            'cookie': DUEL_COOKIES,
+                            'origin': 'https://duel.com',
+                            'priority': 'u=1, i',
+                            'referer': 'https://duel.com/dice',
+                            'sec-ch-ua': '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                            'sec-ch-ua-arch': '""',
+                            'sec-ch-ua-bitness': '"64"',
                             'sec-ch-ua-full-version-list': '"Brave";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"',
-                            'sec-ch-ua-mobile':            '?1',
-                            'sec-ch-ua-model':             '"iPhone"',
-                            'sec-ch-ua-platform':          '"iOS"',
-                            'sec-ch-ua-platform-version':  '"18.5"',
-                            'sec-fetch-dest':              'empty',
-                            'sec-fetch-mode':              'cors',
-                            'sec-fetch-site':              'same-origin',
-                            'sec-gpc':                     '1',
-                            'user-agent':                  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
-                            'x-duel-device-identifier':    DUEL_DEVICE_UUID,
-                            'x-env-class':                 'blue'
+                            'sec-ch-ua-mobile': '?1',
+                            'sec-ch-ua-model': '"iPhone"',
+                            'sec-ch-ua-platform': '"iOS"',
+                            'sec-ch-ua-platform-version': '"18.5"',
+                            'sec-fetch-dest': 'empty',
+                            'sec-fetch-mode': 'cors',
+                            'sec-fetch-site': 'same-origin',
+                            'sec-gpc': '1',
+                            'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+                            'x-duel-device-identifier': DUEL_DEVICE_UUID,
+                            'x-env-class': 'blue'
                         }
                     }
                 );
 
-                const rawBody   = response.data; // string because responseType:'text'
+                const rawBody = response.data; // string because responseType:'text'
                 const rawLength = Buffer.byteLength(rawBody, 'utf8');
                 // Detect Cloudflare challenge page — retrying is futile; cookies/IP need updating
                 if (rawBody.includes('cf_chl_opt') || rawBody.includes('cdn-cgi/challenge-platform') || rawBody.includes('Security check')) {
@@ -894,8 +894,8 @@ async function fetchDuelToken() {
                     throw new Error(`Duel token API returned non-success after ${MAX_ATTEMPTS} attempts`);
                 }
 
-                const expiresIn    = body.expires_in || 600;
-                duelToken          = body.token;
+                const expiresIn = body.expires_in || 600;
+                duelToken = body.token;
                 duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000;
                 console.log(`[TOKEN] Valid token obtained (${rawLength} bytes | ${duelToken.substring(0, 12)}...). Expires in ~${expiresIn}s.`);
                 return duelToken;
@@ -945,14 +945,14 @@ function isTokenError(body) {
 async function callDuelApi(method, url, payload, extraHeaders = {}) {
     const makeRequest = async (token) => {
         const headers = {
-            'accept':                   'application/json, text/plain, */*',
-            'content-type':             'application/json',
-            'cookie':                   DUEL_COOKIES,
-            'origin':                   'https://duel.com',
-            'referer':                  'https://duel.com/dice',
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/json',
+            'cookie': DUEL_COOKIES,
+            'origin': 'https://duel.com',
+            'referer': 'https://duel.com/dice',
             'x-duel-device-identifier': DUEL_DEVICE_UUID,
-            'x-env-class':              'blue',
-            'x-security-token':         token,
+            'x-env-class': 'blue',
+            'x-security-token': token,
             ..._randomBetHeaders(),    // rotates UA / accept-language / priority / sec-gpc
             ...extraHeaders
         };
@@ -970,7 +970,7 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
             console.log(`[DUEL-API] Response status: ${result.status} | body: ${JSON.stringify(result.data)}`);
             return result.data;
         } catch (axiosErr) {
-            const status  = axiosErr.response?.status;
+            const status = axiosErr.response?.status;
             const errBody = axiosErr.response?.data;
             console.error(`[DUEL-API] HTTP ${status ?? 'N/A'} from Duel | URL: ${url} | Body: ${JSON.stringify(errBody ?? axiosErr.message)}`);
             if (errBody && isTokenError(errBody)) {
@@ -982,7 +982,7 @@ async function callDuelApi(method, url, payload, extraHeaders = {}) {
     };
 
     let token = await getValidDuelToken();
-    let body  = await makeRequest(token);
+    let body = await makeRequest(token);
 
     // ---- Token rejection: refresh + single retry ----
     if (isTokenError(body)) {
@@ -1089,10 +1089,10 @@ async function placeDiceBet(amount, userId) {
 }
 
 async function runStrategyTick(session, key) {
-    const def   = STRATEGY_DEFS.find(d => d.key === key);
+    const def = STRATEGY_DEFS.find(d => d.key === key);
     if (!def) return;
     const state = session.state[key];
-    
+
     // Determine dynamic base amount based on active complex phase or standard default
     let base = 0.00025;
     if (session.complexMode) {
@@ -1129,14 +1129,14 @@ async function runStrategyTick(session, key) {
         if (!r.isWin) {
             state.lossStreak++;
             pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (${state.lossStreak}/${effectiveWaitFor}) — No Coin | ${formatRound(r.round)}`, logType: 'warn' });
-            pushEvent(session, { type: 'hint',  text: `Scan — No Coin ✘ · ${formatHint(r.round)}` });
+            pushEvent(session, { type: 'hint', text: `Scan — No Coin ✘ · ${formatHint(r.round)}` });
             if (state.lossStreak >= effectiveWaitFor) {
                 state.phase = 'betting'; state.betStep = 0; state.lossStreak = 0;
                 pushEvent(session, { type: 'log', message: `  [${def.name}] Trigger! ${effectiveWaitFor} scans — Mining START`, logType: 'system' });
             }
         } else {
             pushEvent(session, { type: 'log', message: `  [${def.name}] Scan (0/${effectiveWaitFor}) — Coin Found${state.lossStreak > 0 ? ', count reset' : ''} | ${formatRound(r.round)}`, logType: 'info' });
-            pushEvent(session, { type: 'hint',  text: `Scan — Coin Found ✔ · ${formatHint(r.round)}` });
+            pushEvent(session, { type: 'hint', text: `Scan — Coin Found ✔ · ${formatHint(r.round)}` });
             state.lossStreak = 0;
         }
     } else {
@@ -1146,7 +1146,7 @@ async function runStrategyTick(session, key) {
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
             return;
         }
-        const bet  = seq[state.betStep];
+        const bet = seq[state.betStep];
         const step = state.betStep + 1;
 
         // Track highest MTG step reached this session
@@ -1170,18 +1170,18 @@ async function runStrategyTick(session, key) {
             session.waitingForStep4Confirmation = true;
             pushEvent(session, { type: 'confirm_step_4', step: 4, amount: bet });
             pushEvent(session, { type: 'log', message: `[WARNING] MTG Step 4 reached. Waiting for client confirmation to proceed...`, logType: 'warn' });
-            
+
             while (session.waitingForStep4Confirmation && session.isRunning) {
                 await sleep(500);
             }
-            
+
             if (!session.isRunning || session.waitingForStep4Confirmation) {
                 return;
             }
         }
         // ─────────────────────────────────────────────────────────────────────
 
-        pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — $${bet}  (Bal: ${currentBalance.toFixed(4)} LTC)`, logType: 'system' });
+        pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — ${bet.toFixed(8)} LTC  (Bal: ${currentBalance.toFixed(8)} LTC)`, logType: 'system' });
         pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: null });
 
         const r = await placeDiceBet(bet, session.userId);
@@ -1201,30 +1201,30 @@ async function runStrategyTick(session, key) {
             session.totalProfit = +(session.totalProfit + bet).toFixed(8);
             pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'win' });
             pushEvent(session, { type: 'log', message: `  [${def.name}] COIN FOUND  +$${bet.toFixed(4)}  |  Net: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)} | ${formatRound(r.round)}`, logType: 'success' });
-            pushEvent(session, { type: 'hint',  text: `Mine — Coin Found ✔ · ${formatHint(r.round)}` });
+            pushEvent(session, { type: 'hint', text: `Mine — Coin Found ✔ · ${formatHint(r.round)}` });
             // ── Update Firebase: +bet on win ────────────────────────────────
             const newBal = await adjustUserBalance(session.userId, bet);
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: bet });
             // ────────────────────────────────────────────────────────────────
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
             session.confirmedStep4 = false; // Reset confirmation for next MTG cycle
-            
+
             // ── Complex mode: count wins, advance phase, check profit target ─
             if (session.complexMode) {
                 session.complexPhaseWins++;
                 const completedIdx = session.complexPhaseIndex;
-                const curPhase     = COMPLEX_PHASES[completedIdx];
+                const curPhase = COMPLEX_PHASES[completedIdx];
                 if (session.complexPhaseWins >= curPhase.winsNeeded) {
                     // Loop but skip Phase 0 (index 0) on wrap around (completedIdx is index 4, next is index 1)
-                    const nextIdx   = (completedIdx === COMPLEX_PHASES.length - 1) ? 1 : completedIdx + 1;
+                    const nextIdx = (completedIdx === COMPLEX_PHASES.length - 1) ? 1 : completedIdx + 1;
                     const nextPhase = COMPLEX_PHASES[nextIdx];
-                    const cycleMsg  = nextIdx === 1 && completedIdx === COMPLEX_PHASES.length - 1 ? ' — cycle complete, restarting' : '';
+                    const cycleMsg = nextIdx === 1 && completedIdx === COMPLEX_PHASES.length - 1 ? ' — cycle complete, restarting' : '';
                     session.complexPhaseIndex = nextIdx;
-                    session.complexPhaseWins  = 0;
-                    session.activeKeys        = [nextPhase.strategyKey];
+                    session.complexPhaseWins = 0;
+                    session.activeKeys = [nextPhase.strategyKey];
                     session.state[nextPhase.strategyKey] = { phase: 'waiting', lossStreak: 0, betStep: 0 };
                     pushEvent(session, { type: 'log', message: `[COMPLEX] ✔ ${curPhase.name} done${cycleMsg} → ${nextPhase.name} (${nextPhase.winsNeeded} win${nextPhase.winsNeeded > 1 ? 's' : ''} target)`, logType: 'system' });
-                    pushEvent(session, { type: 'hint',  text: `${curPhase.name} done → ${nextPhase.name}` });
+                    pushEvent(session, { type: 'hint', text: `${curPhase.name} done → ${nextPhase.name}` });
                 } else {
                     pushEvent(session, { type: 'log', message: `[COMPLEX] Win ${session.complexPhaseWins}/${curPhase.winsNeeded} in ${curPhase.name}`, logType: 'info' });
                 }
@@ -1253,7 +1253,7 @@ async function runStrategyTick(session, key) {
             session.totalProfit = +(session.totalProfit - bet).toFixed(8);
             pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: 'loss' });
             pushEvent(session, { type: 'log', message: `  [${def.name}] NO COIN  -$${bet.toFixed(4)}  |  Net: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)} | ${formatRound(r.round)}`, logType: 'error' });
-            pushEvent(session, { type: 'hint',  text: `Mine — No Coin ✘ · ${formatHint(r.round)}` });
+            pushEvent(session, { type: 'hint', text: `Mine — No Coin ✘ · ${formatHint(r.round)}` });
             // ── Update Firebase: -bet on loss ───────────────────────────────
             const newBal = await adjustUserBalance(session.userId, -bet);
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: -bet });
@@ -1270,15 +1270,15 @@ async function runStrategyTick(session, key) {
 }
 
 async function startStrategyLoop(session) {
-    session.isRunning    = true;
+    session.isRunning = true;
     session.stopWhenSafe = false;
 
     // ── Capture starting balance + session metadata for profit tracking ───────
     {
         const initBal = await getUserBalance(session.userId);
-        session.startBalance        = initBal !== null ? initBal : 0;
-        session.sessionStartTime    = Date.now();
-        session.maxMtgStepReached   = 0;
+        session.startBalance = initBal !== null ? initBal : 0;
+        session.sessionStartTime = Date.now();
+        session.maxMtgStepReached = 0;
         session.profitTargetReached = false;
         console.log(`[STRATEGY] Starting balance for ${session.userId}: ${session.startBalance.toFixed(8)} LTC`);
     }
@@ -1288,10 +1288,10 @@ async function startStrategyLoop(session) {
     // 1. Rotate seed once via the rate-limited queue
     // 2. Start at Phase 0
     if (session.complexMode) {
-        session.complexPhaseIndex   = 0;
-        session.complexPhaseWins    = 0;
-        session.activeKeys          = [COMPLEX_PHASES[0].strategyKey];
-        session.confirmedStep4      = false;
+        session.complexPhaseIndex = 0;
+        session.complexPhaseWins = 0;
+        session.activeKeys = [COMPLEX_PHASES[0].strategyKey];
+        session.confirmedStep4 = false;
         session.waitingForStep4Confirmation = false;
         STRATEGY_DEFS.forEach(d => { session.state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
         pushEvent(session, { type: 'log', message: `[COMPLEX] MTG Level: ${session.mtgLevel}. Rotating seed...`, logType: 'system' });
@@ -1334,7 +1334,7 @@ async function startStrategyLoop(session) {
         console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
         pushEvent(session, { type: 'log', message: `[ERROR] Loop crashed: ${err.message}`, logType: 'error' });
     }
-    session.isRunning    = false;
+    session.isRunning = false;
     session.stopWhenSafe = false;
     pushEvent(session, { type: 'stopped', totalTrades: session.totalTrades, totalProfit: session.totalProfit });
     console.log(`[STRATEGY] Ended for ${session.userId} | trades:${session.totalTrades} profit:${session.totalProfit}`);
@@ -1344,9 +1344,9 @@ async function startStrategyLoop(session) {
 app.get('/strategy/events', (req, res) => {
     const userId = req.query.user_id;
     if (!userId) return res.status(400).end();
-    res.setHeader('Content-Type',      'text/event-stream');
-    res.setHeader('Cache-Control',     'no-cache');
-    res.setHeader('Connection',        'keep-alive');
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
     if (!strategySessions.has(userId)) strategySessions.set(userId, createSession(userId));
@@ -1374,8 +1374,8 @@ app.get('/strategy/events', (req, res) => {
 // Route: strategy preview — returns nonce, session ID, and sequence before user confirms start
 app.get('/strategy/preview', async (req, res) => {
     const { mtg_level = 1 } = req.query;
-    const level   = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
-    const seq     = getMtgSequence(level);
+    const level = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    const seq = getMtgSequence(level);
     const sessionId = Math.random().toString(36).substring(2, 9).toUpperCase();
     let nonce = '—';
     try {
@@ -1405,8 +1405,8 @@ app.post('/strategy/start', (req, res) => {
     const startLock = getUserLockInfo(user_id);
     if (startLock) {
         return res.status(403).json({
-            success:     false,
-            error:       `Trading locked for 20 hours. Remaining: ${formatDuration(startLock.remainingMs)}`,
+            success: false,
+            error: `Trading locked for 20 hours. Remaining: ${formatDuration(startLock.remainingMs)}`,
             lockedUntil: new Date(startLock.lockUntil).toISOString()
         });
     }
@@ -1414,8 +1414,8 @@ app.post('/strategy/start', (req, res) => {
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
     if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
-    session.activeKeys  = activeKeys;
-    session.mtgLevel    = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    session.activeKeys = activeKeys;
+    session.mtgLevel = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
     session.complexMode = isComplex;
     session.totalTrades = 0;
     session.totalProfit = 0;
@@ -1436,10 +1436,10 @@ app.get('/strategy/lock-status', (req, res) => {
     const lockInfo = getUserLockInfo(userId);
     if (!lockInfo) return res.json({ success: true, locked: false });
     return res.json({
-        success:            true,
-        locked:             true,
-        lockUntil:          new Date(lockInfo.lockUntil).toISOString(),
-        remainingMs:        lockInfo.remainingMs,
+        success: true,
+        locked: true,
+        lockUntil: new Date(lockInfo.lockUntil).toISOString(),
+        remainingMs: lockInfo.remainingMs,
         remainingFormatted: formatDuration(lockInfo.remainingMs)
     });
 });
@@ -1462,7 +1462,7 @@ app.post('/strategy/confirm-step-4', (req, res) => {
     if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
     const session = strategySessions.get(user_id);
     if (!session) return res.status(404).json({ success: false, error: 'Session not found' });
-    
+
     if (session.waitingForStep4Confirmation) {
         session.confirmedStep4 = true;
         session.waitingForStep4Confirmation = false;
@@ -1479,7 +1479,7 @@ app.post('/strategy/update', (req, res) => {
     if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
-    if (mtg_level   !== undefined) session.mtgLevel    = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
+    if (mtg_level !== undefined) session.mtgLevel = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
     if (complex_mode !== undefined) session.complexMode = !!complex_mode;
     if (strategies?.length) session.activeKeys = strategies.map(n => STRATEGY_DEFS[n - 1]?.key).filter(Boolean);
     const seq = getMtgSequence(session.mtgLevel);
@@ -1504,29 +1504,29 @@ async function rotateDuelSeed() {
         { client_seed: clientSeed },
         {
             headers: {
-                'accept':                      'application/json, text/plain, */*',
-                'accept-encoding':             'gzip, deflate, br, zstd',
-                'accept-language':             'en-GB,en;q=0.6',
-                'content-type':                'application/json',
-                'cookie':                      DUEL_SEED_COOKIES,
-                'origin':                      'https://duel.com',
-                'priority':                    'u=1, i',
-                'referer':                     'https://duel.com/dice',
-                'sec-ch-ua':                   '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-                'sec-ch-ua-arch':              '"x86"',
-                'sec-ch-ua-bitness':           '"64"',
+                'accept': 'application/json, text/plain, */*',
+                'accept-encoding': 'gzip, deflate, br, zstd',
+                'accept-language': 'en-GB,en;q=0.6',
+                'content-type': 'application/json',
+                'cookie': DUEL_SEED_COOKIES,
+                'origin': 'https://duel.com',
+                'priority': 'u=1, i',
+                'referer': 'https://duel.com/dice',
+                'sec-ch-ua': '"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-arch': '"x86"',
+                'sec-ch-ua-bitness': '"64"',
                 'sec-ch-ua-full-version-list': '"Brave";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"',
-                'sec-ch-ua-mobile':            '?0',
-                'sec-ch-ua-model':             '""',
-                'sec-ch-ua-platform':          '"Windows"',
-                'sec-ch-ua-platform-version':  '"19.0.0"',
-                'sec-fetch-dest':              'empty',
-                'sec-fetch-mode':              'cors',
-                'sec-fetch-site':              'same-origin',
-                'sec-gpc':                     '1',
-                'user-agent':                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-                'x-duel-device-identifier':    DUEL_DEVICE_UUID,
-                'x-env-class':                 'blue'
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-model': '""',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-platform-version': '"19.0.0"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'sec-gpc': '1',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'x-duel-device-identifier': DUEL_DEVICE_UUID,
+                'x-env-class': 'blue'
             },
             timeout: 15000
         }
@@ -1549,18 +1549,18 @@ app.get('/change_seed', (req, res) => {
 
 // Route: get strategy status
 app.get('/strategy/status', (req, res) => {
-    const userId  = req.query.user_id;
-    if (!userId)  return res.status(400).json({ success: false, error: 'user_id required' });
+    const userId = req.query.user_id;
+    if (!userId) return res.status(400).json({ success: false, error: 'user_id required' });
     const session = strategySessions.get(userId);
     if (!session) return res.json({ success: true, isRunning: false });
     return res.json({
         success: true,
-        isRunning:   session.isRunning,
+        isRunning: session.isRunning,
         totalTrades: session.totalTrades,
         totalProfit: session.totalProfit,
-        mtgLevel:    session.mtgLevel,
+        mtgLevel: session.mtgLevel,
         complexMode: session.complexMode,
-        strategies:  session.activeKeys.map(k => STRATEGY_DEFS.findIndex(d => d.key === k) + 1).filter(n => n > 0)
+        strategies: session.activeKeys.map(k => STRATEGY_DEFS.findIndex(d => d.key === k) + 1).filter(n => n > 0)
     });
 });
 
@@ -1580,12 +1580,12 @@ async function handleLtcTx(tx) {
                 console.log(`[TX] Untracked address: ${addr}`);
                 continue;
             }
-            const userId  = addressToUserId.get(key);
-            const amount  = parseFloat((output.value / LTC_SATOSHIS).toFixed(8));
+            const userId = addressToUserId.get(key);
+            const amount = parseFloat((output.value / LTC_SATOSHIS).toFixed(8));
 
             // Add to accumulated balance (never decreases)
             const prevAccum = userAccumulatedBalance.get(userId) || 0;
-            const newAccum  = parseFloat((prevAccum + amount).toFixed(8));
+            const newAccum = parseFloat((prevAccum + amount).toFixed(8));
             userAccumulatedBalance.set(userId, newAccum);
             lastOnChainSats.set(userId, (lastOnChainSats.get(userId) || 0) + output.value);
 
