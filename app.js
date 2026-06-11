@@ -258,18 +258,27 @@ function acquireBalanceLock(userId, fn) {
     return next;
 }
 
-// ── Global Duel bet serializer — one bet at a time across ALL users ───────────
-// Duel.com uses a single account/token shared by all users, so bets MUST be
-// serialised globally to prevent token races and duplicate-nonce rejections.
-// Per-user queues would allow parallel bets on the same account \u2014 not safe.
-const _duelBetQueues = new Map(); // userId -> Promise (per-user queue)
-function enqueueDuelBet(fn, userId) {
-    // Each user gets their own queue slot; slots run sequentially per-user
-    // but different users can overlap if they happen to use different Duel rounds.
-    // Global serialization is enforced via the shared token refresh lock.
-    const prev = _duelBetQueues.get(userId) || Promise.resolve();
-    const next = prev.then(() => fn(), () => fn());
-    _duelBetQueues.set(userId, next.then(() => undefined, () => undefined));
+// ── Per-server bet serializer — one-at-a-time + 800ms gap per Duel account ────
+// All users on the SAME server share one queue, preventing concurrent bets on the
+// same Duel account and guaranteeing the required 800ms gap between requests.
+const _serverBetQueues = new Map(); // serverId -> { queue: Promise, lastBetAt: number }
+
+function enqueueServerBet(fn, srv) {
+    if (!_serverBetQueues.has(srv.id)) {
+        _serverBetQueues.set(srv.id, { queue: Promise.resolve(), lastBetAt: 0 });
+    }
+    const entry = _serverBetQueues.get(srv.id);
+    const _run = async () => {
+        const waitMs = Math.max(0, 800 - (Date.now() - entry.lastBetAt));
+        if (waitMs > 0) {
+            console.log(`[BET-QUEUE][${srv.label}] Rate-limit: waiting ${waitMs}ms...`);
+            await sleep(waitMs);
+        }
+        entry.lastBetAt = Date.now();
+        return fn();
+    };
+    const next = entry.queue.then(_run, _run); // run even if previous bet errored
+    entry.queue = next.then(() => undefined, () => undefined);
     return next;
 }
 
@@ -1352,7 +1361,7 @@ app.post('/duel-proxy', async (req, res) => {
 
 // ─── Strategy: Server-Side Execution ────────────────────────────────────────────
 async function placeDiceBet(amount, userId, srv = DUEL_SERVERS[0]) {
-    return enqueueDuelBet(async () => {
+    return enqueueServerBet(async () => {
         try {
             // amount 0 = scan (free bet), any positive = real bet
             const amountStr = amount > 0 ? String(amount) : '0';
@@ -1361,16 +1370,17 @@ async function placeDiceBet(amount, userId, srv = DUEL_SERVERS[0]) {
             }, {}, srv);
             if (!resp?.success || !resp?.data?.round) {
                 const errMsg = resp?.message || resp?.error || 'Bet failed or no round data';
-                console.warn(`[BET][${srv.label}] Failed: ${errMsg} | amount: ${amount}`);
+                console.warn(`[BET][${srv.label}] Failed: ${errMsg} | amount: ${amount} | user: ${userId}`);
                 return { success: false, error: errMsg };
             }
+            console.log(`[BET][${srv.label}] OK | user: ${userId} | amount: ${amount} | win: ${resp.data.round.is_win}`);
             return { success: true, isWin: resp.data.round.is_win, round: resp.data.round };
         } catch (err) {
             const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-            console.error(`[BET][${srv.label}] Exception: ${detail}`);
+            console.error(`[BET][${srv.label}] Exception | user: ${userId} | ${detail}`);
             return { success: false, error: err.message };
         }
-    }, userId || 'default');
+    }, srv);
 }
 
 async function runStrategyTick(session, key) {
@@ -1636,7 +1646,7 @@ async function startStrategyLoop(session) {
                 console.log(`[STRATEGY] Safe stop pending for ${session.userId} — MTG set in progress, continuing...`);
             }
             // ─────────────────────────────────────────────────────────────────
-            if (session.isRunning) await randomDelay();
+            // No extra delay here — 800ms is enforced inside enqueueServerBet
         }
     } catch (err) {
         console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
@@ -1721,7 +1731,11 @@ app.post('/strategy/start', (req, res) => {
 
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
+    // Guard against double-start: set isRunning synchronously before any async work
     if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
+    session.isRunning = true; // lock immediately — prevents race if two requests arrive simultaneously
+    // Re-evaluate server assignment on each new session start
+    session.serverConfig = null;
     session.activeKeys = activeKeys;
     session.mtgLevel = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
     session.complexMode = isComplex;
