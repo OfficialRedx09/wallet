@@ -97,7 +97,6 @@ const LITECOIN_NETWORK = {
 // --- Duel.com Token Config ---
 const DUEL_TOKEN_URL = "https://duel.com/api/v2/user/security/token";
 const DUEL_BET_URL = "https://duel.com/api/v2/dice/bet";
-const BLOCKCHAIR_BASE = "https://api.blockchair.com/litecoin";
 const DUEL_SEED_ROTATE_URL = "https://duel.com/api/v2/client-seed/rotate";
 const DUEL_DEVICE_UUID = process.env.DUEL_DEVICE_UUID || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
 // Mobile session cookies — used for all betting calls
