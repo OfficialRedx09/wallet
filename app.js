@@ -205,8 +205,8 @@ let duelTokenRefreshing = null;
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Random trade delay fixed at 500 ms
-const randomDelay = () => sleep(500);
+// Random trade delay fixed at 600 ms
+const randomDelay = () => sleep(600);
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
