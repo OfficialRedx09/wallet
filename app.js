@@ -78,7 +78,7 @@ const BLOCKCHAIR_BASE    = "https://api.blockchair.com/litecoin";    // Tier 2
 const BLOCKCYPHER_BASE   = "https://api.blockcypher.com/v1/ltc/main"; // Tier 3
 const TATUM_BASE = "https://api.tatum.io/v3";                         // Tier 4 (fallback)
 const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a27313caa620fad0caa1d3b-55c14747b32a46bea844dfcd";
-const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
+let TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
 const LTC_SATOSHIS = 1e8;   // 1 LTC = 100,000,000 satoshis
 const SWEEP_FEE_SATS = 10000; // ~0.0001 LTC network fee
 
@@ -98,11 +98,12 @@ const LITECOIN_NETWORK = {
 const DUEL_TOKEN_URL = "https://duel.com/api/v2/user/security/token";
 const DUEL_BET_URL = "https://duel.com/api/v2/dice/bet";
 const DUEL_SEED_ROTATE_URL = "https://duel.com/api/v2/client-seed/rotate";
-const DUEL_DEVICE_UUID = process.env.DUEL_DEVICE_UUID || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
+// ── Duel.com credentials — loaded from Firebase /API_INFO at boot, refreshed every 5 min ──
+let DUEL_DEVICE_UUID = process.env.DUEL_DEVICE_UUID || "30b3dac8-2c30-4ec7-94fd-67186e92e94a";
 // Mobile session cookies — used for all betting calls
-const DUEL_COOKIES = process.env.DUEL_COOKIES || "_sp_ses.d35b=*; duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; env_class=blue; __cf_bm=VStC4zY6cE1KA3LiiKlkdGntPXUGmmpTrCeDvDpek4Q-1780793051.4816592-1.0.1.1-mAUAzG504OpcxaiYq7.M.kkZVJltBNfMeB0NYhsH7j_3LHwps9iNmBldo.MRaAXJMv7KbOXRra2_7fftHoRLiOfmwN3JaU_v4gEGYHJX7E_CQMnxCdjSYZaV6vBjLI8H; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.1.1780793058..6ea60967-0e40-4ad7-b68a-a0ed4ee85838..82d6b3cc-b57c-4085-8641-199b013583e8.1780793046753.9";
+let DUEL_COOKIES = process.env.DUEL_COOKIES || "";
 // Desktop session cookies — used exclusively for seed rotation (separate cf_clearance)
-const DUEL_SEED_COOKIES = process.env.DUEL_SEED_COOKIES || "duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; _sp_ses.d35b=*; cf_clearance=0azt0u7AEb9PL9puC_mtGV.4UsNlBFXB8PlRG8IVaUw-1780797543-1.2.1.1-afHmObdO4TvSjFxk8R7zyuMtFVvrdc8jLvL0kE5scoWaY.LV2C5lr3mEvZ2jicGm5StD65cxcprimS99mmKBhIXtLQQf_VpG0.Bm4piZKRFfRxuGuzq7jIXZ.NOUmNHIOLLUk8NEyca03hXhAfI8Vn9nIO_aVIt_VYvlaexoNcKYRcbabJumntBTokCQr9LT4ihTPU67DaFpyC3hokty9Qj4ptvI4k5wRN6GpUQfgly0xBhhU_vcdrWCsTHWVUZGhl8g.McFtZlp6iqz.vkYCVpER3.DGrjuR1kAnY1MaIAAnsOM6FwH1x.m9ospNj.3CJK9.3HDEu1eNLma9MHrcxBDz9h5hQy.oFBadZHDyxcb1pxKumuk4sPx5nli.xLO0Q1IC9h_5YflcpVGzWS6kMkkTILOpXKksEbS6iuwpGM; __cf_bm=caQj4DVoVqRW4VAjDqT_i1UdIXzdf9ol4ARiI8vq2e0-1780797546.326099-1.0.1.1-Ii960dRYm7J6eFwWzdUP4f8pf1KEVBE2c8bnd50ceuE8JM_KvvfrgVyrZ2BX2cGG03Qosw_92FBJmA9QamOHsie67yauty6JEde4f7B1nLvUuvp3ofjTk1SOH7rfeztH; env_class=blue; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.2.1780797752.1780795546.5a59b211-7504-4443-be44-d171383b4fce.6ea60967-0e40-4ad7-b68a-a0ed4ee85838.1227487e-b463-4bda-a7d5-89c55b46d832.1780797472489.72";
+let DUEL_SEED_COOKIES = process.env.DUEL_SEED_COOKIES || "";
 
 // Core Lookup Maps
 const addressToUserId = new Map();
@@ -205,8 +206,8 @@ let duelTokenRefreshing = null;
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Random trade delay fixed at 800 ms
-const randomDelay = () => sleep(800);
+// Random trade delay fixed at 500 ms
+const randomDelay = () => sleep(500);
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
@@ -1300,6 +1301,14 @@ async function runStrategyTick(session, key) {
         if (!r.success) {
             if (/rejected|expired|cookie/i.test(r.error)) {
                 pushEvent(session, { type: 'log', message: `[${def.name}] Auth error: ${r.error}`, logType: 'error' });
+                sendTelegramMessage(TELEGRAM_CHAT_ID,
+                    `🚨 <b>CRITICAL: Auth / Token Error (Scan Phase)</b>\n` +
+                    `👤 User: <code>${_tgEscape(session.userId)}</code>\n` +
+                    `⚠️ Error: ${_tgEscape(r.error)}\n` +
+                    `📊 Strategy: ${_tgEscape(def.name)}\n` +
+                    `🖥 Server ID: <b>${SERVER_ID}</b> | No: ${SERVER_NO}\n` +
+                    `⏰ ${new Date().toISOString()}`
+                ).catch(e => console.error('[TELEGRAM-CRIT]', e.message));
                 session.isRunning = false;
                 return;
             }
@@ -1343,6 +1352,14 @@ async function runStrategyTick(session, key) {
         }
         if (currentBalance < bet) {
             pushEvent(session, { type: 'error', code: 'INSUFFICIENT_BALANCE', message: 'Insufficient balance to place bet', detail: `Available: ${currentBalance.toFixed(8)} LTC  |  Required: ${bet.toFixed(8)} LTC`, action: 'Strategy stopped — deposit funds to continue' });
+            sendTelegramMessage(TELEGRAM_CHAT_ID,
+                `🚨 <b>CRITICAL: Insufficient Balance</b>\n` +
+                `👤 User: <code>${_tgEscape(session.userId)}</code>\n` +
+                `💰 Available: <b>${currentBalance.toFixed(8)} LTC</b> | Required: <b>${bet.toFixed(8)} LTC</b>\n` +
+                `📊 Strategy: ${_tgEscape(def.name)} | MTG Step: ${step}\n` +
+                `🖥 Server ID: <b>${SERVER_ID}</b>\n` +
+                `⏰ ${new Date().toISOString()}`
+            ).catch(e => console.error('[TELEGRAM-CRIT]', e.message));
             session.isRunning = false;
             return;
         }
@@ -1371,6 +1388,15 @@ async function runStrategyTick(session, key) {
         if (!r.success) {
             if (/rejected|expired|cookie/i.test(r.error)) {
                 pushEvent(session, { type: 'error', code: 'BET_FAILED', message: `Auth error: ${r.error}`, detail: `Strategy: ${def.name} | Step: ${step}/${seq.length} | Amount: $${bet}`, action: 'Update DUEL_COOKIES on server — strategy stopped' });
+                sendTelegramMessage(TELEGRAM_CHAT_ID,
+                    `🚨 <b>CRITICAL: Auth / Token Error (Bet Step ${step})</b>\n` +
+                    `👤 User: <code>${_tgEscape(session.userId)}</code>\n` +
+                    `⚠️ Error: ${_tgEscape(r.error)}\n` +
+                    `📊 Strategy: ${_tgEscape(def.name)} | Step: ${step}/${seq.length}\n` +
+                    `💰 Bet Amount: <b>${bet.toFixed(8)} LTC</b>\n` +
+                    `🖥 Server ID: <b>${SERVER_ID}</b> | No: ${SERVER_NO}\n` +
+                    `⏰ ${new Date().toISOString()}`
+                ).catch(e => console.error('[TELEGRAM-CRIT]', e.message));
                 session.isRunning = false;
                 return;
             }
@@ -1532,6 +1558,14 @@ async function startStrategyLoop(session) {
     } catch (err) {
         console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
         pushEvent(session, { type: 'log', message: `[ERROR] Loop crashed: ${err.message}`, logType: 'error' });
+        sendTelegramMessage(TELEGRAM_CHAT_ID,
+            `🚨 <b>CRITICAL: Strategy Loop Crashed</b>\n` +
+            `👤 User: <code>${_tgEscape(session.userId)}</code>\n` +
+            `💥 Error: ${_tgEscape(err.message)}\n` +
+            `📊 Trades: ${session.totalTrades} | Profit: ${session.totalProfit >= 0 ? '+' : ''}$${session.totalProfit.toFixed(4)}\n` +
+            `🖥 Server ID: <b>${SERVER_ID}</b> | No: ${SERVER_NO}\n` +
+            `⏰ ${new Date().toISOString()}`
+        ).catch(e => console.error('[TELEGRAM-CRIT]', e.message));
     }
     session.isRunning = false;
     session.stopWhenSafe = false;
@@ -1612,7 +1646,7 @@ app.post('/strategy/start', (req, res) => {
 
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
-    if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
+    if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first', serverId: SERVER_ID });
     session.activeKeys = activeKeys;
     session.mtgLevel = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
     session.complexMode = isComplex;
@@ -1856,6 +1890,39 @@ async function loadAccounts() {
     }
 }
 
+// ── Load / hot-reload Duel API credentials from Firebase ────────────────────
+// Reads /API_INFO/<serverKey> where serverKey = "server" + parseInt(SERVER_NO).
+// Called once at boot and then every 5 minutes so updated cookies are picked up
+// automatically without a server restart.
+async function loadApiInfo() {
+    const serverKey = 'server' + parseInt(SERVER_NO, 10);
+    try {
+        const resp = await axios.get(`${DB_BASE}/API_INFO.json`, { timeout: 10000 });
+        const info = resp.data?.[serverKey];
+        if (!info) {
+            console.warn(`[API_INFO] No config found for key "${serverKey}" in Firebase — keeping existing values`);
+            return false;
+        }
+        let changed = false;
+        if (info.cookies    && info.cookies    !== DUEL_COOKIES)      { DUEL_COOKIES      = info.cookies;     changed = true; }
+        if (info.seedCookies && info.seedCookies !== DUEL_SEED_COOKIES) { DUEL_SEED_COOKIES = info.seedCookies; changed = true; }
+        if (info.deviceUuid && info.deviceUuid  !== DUEL_DEVICE_UUID)  { DUEL_DEVICE_UUID  = info.deviceUuid;  changed = true; }
+        if (info.treasury   && info.treasury    !== TREASURY_ADDRESS)   { TREASURY_ADDRESS   = info.treasury;   changed = true; }
+        if (changed) {
+            // Invalidate cached token so next bet re-authenticates with fresh cookies
+            duelToken = null;
+            console.log(`[API_INFO] ✔ Credentials updated for "${serverKey}" | uuid: ${DUEL_DEVICE_UUID.substring(0, 8)}... | treasury: ${TREASURY_ADDRESS}`);
+        } else {
+            console.log(`[API_INFO] No credential change for "${serverKey}"`);
+        }
+        return true;
+    } catch (err) {
+        console.error(`[API_INFO] Failed to load credentials from Firebase: ${err.message} — keeping existing values`);
+        return false;
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Boot Sequence: Load Data -> Fire Up Server
 console.log("[BOOT] Marketwave LTC Server starting...");
 loadAccounts().then(() => {
@@ -1866,6 +1933,14 @@ loadAccounts().then(() => {
     sendTelegramMessage(TELEGRAM_CHAT_ID, `🚀 <b>Marketwave Server Started</b>\nServer ID: ${SERVER_ID}\nServer No: ${SERVER_NO}\nTime: ${new Date().toISOString()}`)
         .then(() => console.log("[BOOT] Telegram test message sent successfully."))
         .catch(err => console.error("[BOOT] Telegram test message failed:", err.message));
+
+    // Load Duel credentials from Firebase before fetching the token.
+    // Also schedules a refresh every 5 minutes so cookie updates are picked up live.
+    console.log("[BOOT] Loading Duel API credentials from Firebase...");
+    await loadApiInfo();
+    setInterval(() => {
+        loadApiInfo().catch(err => console.error('[API_INFO] Periodic refresh failed:', err.message));
+    }, 5 * 60 * 1000); // every 5 minutes
 
     // Fetch a fresh Duel token on every boot — never rely on a cached/hardcoded value.
     // Auto-refresh fires every 590 s to stay ahead of the 600 s expiry.
