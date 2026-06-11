@@ -1925,7 +1925,7 @@ async function loadApiInfo() {
 
 // Boot Sequence: Load Data -> Fire Up Server
 console.log("[BOOT] Marketwave LTC Server starting...");
-loadAccounts().then(() => {
+loadAccounts().then(async () => {
     console.log(`[BOOT] Account load complete. ${addressToUserId.size} address(es) registered. Tatum API ready.`);
 
     // Test Telegram connection on boot
