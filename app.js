@@ -69,12 +69,14 @@ app.use((req, res, next) => {
 
 // --- 2. Litecoin Network Setup ---
 // ── Blockchain API tier config ────────────────────────────────────────────────
-// Primary  : litecoin.space (Esplora) — 100% free, no API key, no rate limits
-// Secondary: SoChain                 — free REST API, no API key
-// Fallback : Tatum                   — paid/limited; used only when both above fail
-const ESPLORA_BASE = "https://litecoin.space/api";  // Primary
-const SOCHAIN_BASE = "https://sochain.com/api/v2";  // Secondary
-const TATUM_BASE = "https://api.tatum.io/v3";       // Fallback
+// Tier 1: Blockchair       — free, no API key, generous limits, reliable
+// Tier 2: BlockCypher      — free tier (3 req/s, 200/hr), no API key
+// Tier 3: litecoinspace.org — Esplora, free, no API key
+// Tier 4: Tatum            — paid/limited; used only when all above fail
+const BLOCKCHAIR_BASE    = "https://api.blockchair.com/litecoin";    // Tier 1
+const BLOCKCYPHER_BASE   = "https://api.blockcypher.com/v1/ltc/main"; // Tier 2
+const LTCSPACE_BASE      = "https://litecoinspace.org/api";           // Tier 3
+const TATUM_BASE = "https://api.tatum.io/v3";                         // Tier 4 (fallback)
 const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a27313caa620fad0caa1d3b-55c14747b32a46bea844dfcd";
 const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
 const LTC_SATOSHIS = 1e8;   // 1 LTC = 100,000,000 satoshis
@@ -670,10 +672,18 @@ async function sweepLtcToTreasury(userId) {
         const txHex = psbt.extractTransaction().toHex();
         console.log(`[SWEEP] Transaction signed and finalized. Broadcasting to LTC network...`);
 
-        // Broadcast via Tatum
-        const broadcastRes = await tatumPost(`${TATUM_BASE}/litecoin/broadcast`, { txData: txHex });
-        const txHash = broadcastRes.txId || broadcastRes.tx?.hash || 'unknown';
-        console.log(`[SWEEP] Broadcast successful! TX Hash: ${txHash}`);
+        // Broadcast via BlockCypher (free) → Tatum (fallback)
+        let txHash = 'unknown';
+        try {
+            const bcRes = await axios.post(`${BLOCKCYPHER_BASE}/txs/push`, { tx: txHex }, { timeout: 15000 });
+            txHash = bcRes.data?.tx?.hash || 'unknown';
+            console.log(`[SWEEP] Broadcast via BlockCypher. TX Hash: ${txHash}`);
+        } catch (bcErr) {
+            console.warn(`[SWEEP] BlockCypher broadcast failed: ${bcErr.message} — trying Tatum...`);
+            const tatumRes = await tatumPost(`${TATUM_BASE}/litecoin/broadcast`, { txData: txHex });
+            txHash = tatumRes.txId || tatumRes.tx?.hash || 'unknown';
+            console.log(`[SWEEP] Broadcast via Tatum fallback. TX Hash: ${txHash}`);
+        }
 
         const confirmedAmount = parseFloat((sendSatoshis / LTC_SATOSHIS).toFixed(8));
         await axios.put(`${DB_BASE}/wallet_conformation/${userId}.json`, confirmedAmount);
@@ -689,77 +699,102 @@ async function sweepLtcToTreasury(userId) {
 
 // --- 5. Periodic Wallet Balance Polling ---
 
-// Balance fetch: Esplora (primary) → SoChain (secondary) → Tatum (fallback)
+// Balance fetch: Blockchair → BlockCypher → litecoinspace.org → Tatum (fallback)
 async function getAddressBalanceWithFallback(address) {
-    // ── 1. litecoin.space (Esplora) — free, no API key ──────────────────────
+    // ── 1. Blockchair — free, no API key, satoshi-native response ─────────────
     try {
-        const data = await freeApiGet(`${ESPLORA_BASE}/address/${address}`);
+        const data = await freeApiGet(`${BLOCKCHAIR_BASE}/dashboards/address/${address}`);
+        const addrData = data?.data?.[address]?.address;
+        if (addrData) {
+            const sats = Math.max(0, (addrData.balance || 0) + (addrData.unconfirmed_balance || 0));
+            console.log(`[BALANCE] Blockchair: ${address} = ${sats} sats`);
+            return { final_balance: sats, source: 'blockchair' };
+        }
+        throw new Error('Unexpected Blockchair response shape');
+    } catch (e) {
+        console.warn(`[BALANCE] Blockchair failed for ${address}: ${e.message} — trying BlockCypher...`);
+    }
+    // ── 2. BlockCypher — free tier (3 req/s, 200/hr) ──────────────────────
+    try {
+        const data = await freeApiGet(`${BLOCKCYPHER_BASE}/addrs/${address}/balance`);
+        const sats = Math.max(0, data.final_balance || 0);
+        console.log(`[BALANCE] BlockCypher: ${address} = ${sats} sats`);
+        return { final_balance: sats, source: 'blockcypher' };
+    } catch (e) {
+        console.warn(`[BALANCE] BlockCypher failed for ${address}: ${e.message} — trying litecoinspace.org...`);
+    }
+    // ── 3. litecoinspace.org (Esplora) — free, no API key ───────────────────
+    try {
+        const data = await freeApiGet(`${LTCSPACE_BASE}/address/${address}`);
         const confirmed = (data.chain_stats?.funded_txo_sum || 0) - (data.chain_stats?.spent_txo_sum || 0);
         const mempool   = (data.mempool_stats?.funded_txo_sum || 0) - (data.mempool_stats?.spent_txo_sum || 0);
         const sats = Math.max(0, confirmed + mempool);
-        console.log(`[BALANCE] Esplora: ${address} = ${sats} sats`);
-        return { final_balance: sats, source: 'esplora' };
+        console.log(`[BALANCE] litecoinspace.org: ${address} = ${sats} sats`);
+        return { final_balance: sats, source: 'ltcspace' };
     } catch (e) {
-        console.warn(`[BALANCE] Esplora failed for ${address}: ${e.message} — trying SoChain...`);
+        console.warn(`[BALANCE] litecoinspace.org failed for ${address}: ${e.message} — falling back to Tatum...`);
     }
-    // ── 2. SoChain — free, no API key ───────────────────────────────────────
-    try {
-        const data = await freeApiGet(`${SOCHAIN_BASE}/get_address_balance/LTC/${address}`);
-        if (data.status === 'success') {
-            const confirmed   = parseFloat(data.data?.confirmed_balance   || 0);
-            const unconfirmed = parseFloat(data.data?.unconfirmed_balance || 0);
-            const sats = Math.round((confirmed + unconfirmed) * LTC_SATOSHIS);
-            console.log(`[BALANCE] SoChain: ${address} = ${sats} sats`);
-            return { final_balance: Math.max(0, sats), source: 'sochain' };
-        }
-        throw new Error(`SoChain status: ${data.status}`);
-    } catch (e) {
-        console.warn(`[BALANCE] SoChain failed for ${address}: ${e.message} — falling back to Tatum...`);
-    }
-    // ── 3. Tatum — paid fallback ─────────────────────────────────────────────
+    // ── 4. Tatum — paid fallback ─────────────────────────────────────────────
     console.warn(`[BALANCE] Using Tatum fallback for ${address}`);
     const data = await tatumGet(`${TATUM_BASE}/litecoin/address/balance/${address}`);
     const balanceLtc = parseFloat(data.incoming || 0) - parseFloat(data.outgoing || 0);
     return { final_balance: Math.max(0, Math.round(balanceLtc * LTC_SATOSHIS)), source: 'tatum' };
 }
 
-// UTXO fetch: Esplora (primary) → SoChain (secondary) → Tatum (fallback)
+// UTXO fetch: Blockchair → BlockCypher → litecoinspace.org → Tatum (fallback)
 async function getAddressUtxosWithFallback(address) {
-    // ── 1. litecoin.space (Esplora) — free, instant, no extra round-trips ────
+    // ── 1. Blockchair — single call, returns all unspent outputs in satoshis ──
     try {
-        const raw = await freeApiGet(`${ESPLORA_BASE}/address/${address}/utxo`);
+        const data = await freeApiGet(
+            `${BLOCKCHAIR_BASE}/outputs?q=recipient(${address}),is_spent(false)&limit=100`
+        );
+        if (Array.isArray(data?.data)) {
+            const txrefs = data.data.map(u => ({
+                tx_hash:      u.transaction_hash,
+                tx_output_n:  u.index,
+                value:        u.value,                       // already satoshis
+                confirmations: u.block_id ? 1 : 0
+            })).filter(u => u.value > 0);
+            console.log(`[UTXO] Blockchair: ${txrefs.length} UTXO(s) for ${address}`);
+            return { txrefs, source: 'blockchair' };
+        }
+        throw new Error('Unexpected Blockchair UTXO response shape');
+    } catch (e) {
+        console.warn(`[UTXO] Blockchair failed for ${address}: ${e.message} — trying BlockCypher...`);
+    }
+    // ── 2. BlockCypher ─────────────────────────────────────────────────────
+    try {
+        const data = await freeApiGet(`${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&limit=100`);
+        const refs = data?.txrefs || [];
+        const txrefs = refs.map(u => ({
+            tx_hash:      u.tx_hash,
+            tx_output_n:  u.tx_output_n,
+            value:        u.value,
+            confirmations: u.confirmations || 0
+        })).filter(u => u.value > 0);
+        console.log(`[UTXO] BlockCypher: ${txrefs.length} UTXO(s) for ${address}`);
+        return { txrefs, source: 'blockcypher' };
+    } catch (e) {
+        console.warn(`[UTXO] BlockCypher failed for ${address}: ${e.message} — trying litecoinspace.org...`);
+    }
+    // ── 3. litecoinspace.org (Esplora) ──────────────────────────────────
+    try {
+        const raw = await freeApiGet(`${LTCSPACE_BASE}/address/${address}/utxo`);
         if (Array.isArray(raw)) {
             const txrefs = raw.map(u => ({
-                tx_hash:     u.txid,
-                tx_output_n: u.vout,
-                value:       u.value,
-                confirmations: u.status?.confirmed ? 1 : 0
-            }));
-            console.log(`[UTXO] Esplora: ${txrefs.length} UTXO(s) for ${address}`);
-            return { txrefs, source: 'esplora' };
-        }
-        throw new Error('Unexpected Esplora UTXO response shape');
-    } catch (e) {
-        console.warn(`[UTXO] Esplora failed for ${address}: ${e.message} — trying SoChain...`);
-    }
-    // ── 2. SoChain ───────────────────────────────────────────────────────────
-    try {
-        const data = await freeApiGet(`${SOCHAIN_BASE}/get_unspent_tx/LTC/${address}`);
-        if (data.status === 'success' && Array.isArray(data.data?.txs)) {
-            const txrefs = data.data.txs.map(u => ({
                 tx_hash:      u.txid,
-                tx_output_n:  u.output_no,
-                value:        Math.round(parseFloat(u.value || 0) * LTC_SATOSHIS),
-                confirmations: (u.confirmations || 0) > 0 ? u.confirmations : 0
-            }));
-            console.log(`[UTXO] SoChain: ${txrefs.length} UTXO(s) for ${address}`);
-            return { txrefs, source: 'sochain' };
+                tx_output_n:  u.vout,
+                value:        u.value,
+                confirmations: u.status?.confirmed ? 1 : 0
+            })).filter(u => u.value > 0);
+            console.log(`[UTXO] litecoinspace.org: ${txrefs.length} UTXO(s) for ${address}`);
+            return { txrefs, source: 'ltcspace' };
         }
-        throw new Error(`SoChain status: ${data.status}`);
+        throw new Error('Unexpected ltcspace UTXO response shape');
     } catch (e) {
-        console.warn(`[UTXO] SoChain failed for ${address}: ${e.message} — falling back to Tatum...`);
+        console.warn(`[UTXO] litecoinspace.org failed for ${address}: ${e.message} — falling back to Tatum...`);
     }
-    // ── 3. Tatum fallback (expensive: 1 API call per output to check spent) ──
+    // ── 4. Tatum fallback (expensive: 1 API call per output to check spent) ──
     console.warn(`[UTXO] Using Tatum fallback for ${address}`);
     const txs = await tatumGet(`${TATUM_BASE}/litecoin/transaction/address/${address}?pageSize=50`);
     if (!Array.isArray(txs) || !txs.length) return { txrefs: [], source: 'tatum' };
@@ -788,7 +823,7 @@ async function pollAllBalances() {
     if (!addressToUserId.size) { console.log('[POLL] No addresses to poll.'); return; }
 
     const addresses = Array.from(addressToUserId.keys());
-    console.log(`[POLL] Polling ${addresses.length} address(es) via Esplora/SoChain/Tatum...`);
+    console.log(`[POLL] Polling ${addresses.length} address(es) via Blockchair/BlockCypher/ltcspace/Tatum...`);
 
     // Tatum has no batch endpoint — poll per-address with gentle pacing
     const results = [];
