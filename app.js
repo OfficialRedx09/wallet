@@ -129,6 +129,9 @@ const SERVER_ID = process.env.SERVER_ID || '102030';
 const SERVER_NO = process.env.SERVER_NO || '01';
 const COMPLEX_PROFIT_TARGET = 0.50;                   // $0.50 profit triggers notification + lock
 const LTC_TO_BDT_RATE = 5000;                   // 1 LTC ≈ 5000 BDT  (balance / 0.00025 × 1.25)
+const DAILY_PROFIT_TARGET_BDT = 50;              // Daily profit cap: 50 BDT
+const DAILY_PROFIT_TARGET_LTC = DAILY_PROFIT_TARGET_BDT / LTC_TO_BDT_RATE; // 0.01 LTC
+const DAILY_RESET_MS = 24 * 60 * 60 * 1000;     // 24-hour daily reset window
 const USER_LOCK_DURATION_MS = 20 * 60 * 60 * 1000;   // 20 hours in ms
 
 // Per-user bet lock — user cannot trade for 20 h after complex-mode profit target is hit
@@ -448,6 +451,51 @@ async function adjustUserBalance(userId, delta) {
             return null;
         }
     });
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Daily profit tracking (temp_balance in Firebase, resets every 24 h) ──────
+// In-memory cache avoids a Firebase round-trip on every bet tick.
+const _dailyProfitCache = new Map(); // userId -> { profit_ltc, started_at }
+
+async function getDailyProfitState(userId) {
+    const cached = _dailyProfitCache.get(userId);
+    if (cached) {
+        if (Date.now() - cached.started_at < DAILY_RESET_MS) return cached;
+        // Expired — fall through to reset
+    }
+    // Try loading from Firebase
+    try {
+        const snap = await axios.get(`${DB_BASE}/crypto_accounts/${userId}/temp_balance.json`, { timeout: 8000 });
+        const data = snap.data;
+        if (data && data.started_at && (Date.now() - data.started_at) < DAILY_RESET_MS) {
+            _dailyProfitCache.set(userId, data);
+            return data;
+        }
+    } catch (_) { /* ignore read errors — create fresh */ }
+    // Create fresh 24-h window
+    const fresh = { profit_ltc: 0, started_at: Date.now() };
+    _dailyProfitCache.set(userId, fresh);
+    axios.put(`${DB_BASE}/crypto_accounts/${userId}/temp_balance.json`, fresh, { timeout: 8000 })
+        .catch(e => console.error(`[DAILY] Firebase init error for ${userId}: ${e.message}`));
+    return fresh;
+}
+
+// Add delta to today's profit, persist to Firebase, return updated total.
+// Returns null only on a hard cache error (extremely rare).
+async function addDailyProfit(userId, delta) {
+    try {
+        const state = await getDailyProfitState(userId);
+        state.profit_ltc = parseFloat((state.profit_ltc + delta).toFixed(8));
+        _dailyProfitCache.set(userId, state);
+        // Persist asynchronously — don't block the bet loop
+        axios.patch(`${DB_BASE}/crypto_accounts/${userId}/temp_balance.json`, { profit_ltc: state.profit_ltc }, { timeout: 8000 })
+            .catch(e => console.error(`[DAILY] Firebase update error for ${userId}: ${e.message}`));
+        return state.profit_ltc;
+    } catch (err) {
+        console.error(`[DAILY] addDailyProfit error for ${userId}: ${err.message}`);
+        return null;
+    }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1206,6 +1254,19 @@ async function runStrategyTick(session, key) {
             const newBal = await adjustUserBalance(session.userId, bet);
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: bet });
             // ────────────────────────────────────────────────────────────────
+            // ── Daily profit target check ────────────────────────────────────
+            const newDailyProfit = await addDailyProfit(session.userId, bet);
+            if (newDailyProfit !== null && newDailyProfit >= DAILY_PROFIT_TARGET_LTC) {
+                const bdtProfit = (newDailyProfit * LTC_TO_BDT_RATE).toFixed(2);
+                console.log(`[DAILY] User ${session.userId} hit daily profit target: ${newDailyProfit.toFixed(8)} LTC (${bdtProfit} BDT)`);
+                pushEvent(session, { type: 'daily_profit_hit', profit_ltc: newDailyProfit, profit_bdt: parseFloat(bdtProfit) });
+                pushEvent(session, { type: 'log', message: `🎯 Daily profit target reached! +${bdtProfit} BDT — Trading stopped. Resets in 24 hours.`, logType: 'success' });
+                state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
+                session.confirmedStep4 = false;
+                session.isRunning = false;
+                return;
+            }
+            // ────────────────────────────────────────────────────────────────
             state.phase = 'waiting'; state.betStep = 0; state.lossStreak = 0;
             session.confirmedStep4 = false; // Reset confirmation for next MTG cycle
 
@@ -1257,6 +1318,9 @@ async function runStrategyTick(session, key) {
             // ── Update Firebase: -bet on loss ───────────────────────────────
             const newBal = await adjustUserBalance(session.userId, -bet);
             if (newBal !== null) pushEvent(session, { type: 'balance_update', balance: newBal, delta: -bet });
+            // ────────────────────────────────────────────────────────────────
+            // ── Daily profit tracking (loss reduces daily net) ───────────────
+            await addDailyProfit(session.userId, -bet);
             // ────────────────────────────────────────────────────────────────
             state.betStep++;
             if (state.betStep >= seq.length) {
