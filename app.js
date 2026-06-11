@@ -21,8 +21,7 @@ app.get('/health', (req, res) => {
         memory: process.memoryUsage(),
         users: strategySessions.size,
         addresses: addressToUserId.size,
-        tokenOk: DUEL_SERVERS.every(s => { const st = _serverTokens.get(s.id); return !!(st?.token && Date.now() < st.expiresAt); }),
-        servers: DUEL_SERVERS.map(s => { const st = _serverTokens.get(s.id); return { id: s.id, label: s.label, tokenOk: !!(st?.token && Date.now() < st.expiresAt) }; }),
+        tokenOk: !!(duelToken && Date.now() < duelTokenExpiresAt),
         timestamp: new Date().toISOString()
     });
 });
@@ -74,9 +73,9 @@ app.use((req, res, next) => {
 // Tier 2: Blockchair       — free, no API key, generous limits, reliable
 // Tier 3: BlockCypher      — free tier (3 req/s, 200/hr), no API key
 // Tier 4: Tatum            — paid/limited; used only when all above fail
-const LTCSPACE_BASE = "https://litecoinspace.org/api";           // Tier 1
-const BLOCKCHAIR_BASE = "https://api.blockchair.com/litecoin";    // Tier 2
-const BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/ltc/main"; // Tier 3
+const LTCSPACE_BASE      = "https://litecoinspace.org/api";           // Tier 1
+const BLOCKCHAIR_BASE    = "https://api.blockchair.com/litecoin";    // Tier 2
+const BLOCKCYPHER_BASE   = "https://api.blockcypher.com/v1/ltc/main"; // Tier 3
 const TATUM_BASE = "https://api.tatum.io/v3";                         // Tier 4 (fallback)
 const TATUM_API_KEY = process.env.TATUM_API_KEY || "t-6a27313caa620fad0caa1d3b-55c14747b32a46bea844dfcd";
 const TREASURY_ADDRESS = "ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy";
@@ -104,109 +103,6 @@ const DUEL_DEVICE_UUID = process.env.DUEL_DEVICE_UUID || "30b3dac8-2c30-4ec7-94f
 const DUEL_COOKIES = process.env.DUEL_COOKIES || "_sp_ses.d35b=*; duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; env_class=blue; __cf_bm=VStC4zY6cE1KA3LiiKlkdGntPXUGmmpTrCeDvDpek4Q-1780793051.4816592-1.0.1.1-mAUAzG504OpcxaiYq7.M.kkZVJltBNfMeB0NYhsH7j_3LHwps9iNmBldo.MRaAXJMv7KbOXRra2_7fftHoRLiOfmwN3JaU_v4gEGYHJX7E_CQMnxCdjSYZaV6vBjLI8H; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.1.1780793058..6ea60967-0e40-4ad7-b68a-a0ed4ee85838..82d6b3cc-b57c-4085-8641-199b013583e8.1780793046753.9";
 // Desktop session cookies — used exclusively for seed rotation (separate cf_clearance)
 const DUEL_SEED_COOKIES = process.env.DUEL_SEED_COOKIES || "duel=fJI8qZPHDZxyAltk5VkpliO7W6CsGt0DRolgMOZi; do_not_share_this_with_anyone_not_even_staff=4975939_WuJSRlH4AC5r6j18mqc0c0eSh4q0dpVXCkXrYBCSXghU4piA66UO9VaY6N0L; _sp_ses.d35b=*; cf_clearance=0azt0u7AEb9PL9puC_mtGV.4UsNlBFXB8PlRG8IVaUw-1780797543-1.2.1.1-afHmObdO4TvSjFxk8R7zyuMtFVvrdc8jLvL0kE5scoWaY.LV2C5lr3mEvZ2jicGm5StD65cxcprimS99mmKBhIXtLQQf_VpG0.Bm4piZKRFfRxuGuzq7jIXZ.NOUmNHIOLLUk8NEyca03hXhAfI8Vn9nIO_aVIt_VYvlaexoNcKYRcbabJumntBTokCQr9LT4ihTPU67DaFpyC3hokty9Qj4ptvI4k5wRN6GpUQfgly0xBhhU_vcdrWCsTHWVUZGhl8g.McFtZlp6iqz.vkYCVpER3.DGrjuR1kAnY1MaIAAnsOM6FwH1x.m9ospNj.3CJK9.3HDEu1eNLma9MHrcxBDz9h5hQy.oFBadZHDyxcb1pxKumuk4sPx5nli.xLO0Q1IC9h_5YflcpVGzWS6kMkkTILOpXKksEbS6iuwpGM; __cf_bm=caQj4DVoVqRW4VAjDqT_i1UdIXzdf9ol4ARiI8vq2e0-1780797546.326099-1.0.1.1-Ii960dRYm7J6eFwWzdUP4f8pf1KEVBE2c8bnd50ceuE8JM_KvvfrgVyrZ2BX2cGG03Qosw_92FBJmA9QamOHsie67yauty6JEde4f7B1nLvUuvp3ofjTk1SOH7rfeztH; env_class=blue; _sp_id.d35b=0c804d9c-585b-41cc-8780-b0208eb9d708.1780793028.2.1780797752.1780795546.5a59b211-7504-4443-be44-d171383b4fce.6ea60967-0e40-4ad7-b68a-a0ed4ee85838.1227487e-b463-4bda-a7d5-89c55b46d832.1780797472489.72";
-
-// ── Multi-server Duel.com config — loaded from Firebase API_INFO.json at boot ──
-// Populated by loadServerConfig(); starts empty so nothing runs before load.
-let DUEL_SERVERS = [];
-
-// Hardcoded fallback — used when Firebase API_INFO.json is unavailable
-const _DUEL_SERVERS_FALLBACK = [
-    {
-        id: 'S1', label: 'Server 1',
-        deviceUuid: DUEL_DEVICE_UUID,
-        cookies: DUEL_COOKIES,
-        seedCookies: DUEL_SEED_COOKIES,
-        envClass: 'blue',
-        treasury: 'ltc1qxgyxnq3yq02kl0ts7uyldzkkypag4zdws759zy'
-    },
-    {
-        id: 'S2', label: 'Server 2',
-        deviceUuid: '1f88ffb7-29fc-4675-87ff-2c7132dba452',
-        cookies: '_sp_ses.d35b=*; CookieConsent={stamp:\'OBlZx6q4vyJi3O+QFD4zxIy4Zroo4MHNOjV2VGAoqg+v/G1H7tYwGg==\'%2Cnecessary:true%2Cpreferences:true%2Cstatistics:true%2Cmarketing:true%2Cmethod:\'explicit\'%2Cver:1%2Cutc:1781156864887%2Cregion:\'bd\'}; _fbp=fb.1.1781156864431.666531751150077208.AQYAAQIB; duel=uS9TcydoBP39TccFJClSODw2zxz1ILWPn3O12Wrn; do_not_share_this_with_anyone_not_even_staff=5357361_FEqYpsxExOtTL0781OUpp5zAB6QR9hWp1eWRStQEIgCmntKDE0d9J11sofyw; __cf_bm=LQ9LA5y3JWbcCNJEfiAfbUryl6anoPbbVnfsliyaWkE-1781157080.0063162-1.0.1.1-2V7VnUpdGL5V85PITJZRzOUzYmPMEh7HyB8Qiecv6U4J1hd60CA.t1nbRx57jNawRVpRXPBIyP6srh8yT4djgd7vg3sGOhjknUHjXH.z.9fyv19UYhOG5x8NJ8LnDadS; _sp_id.d35b=25153949-fea8-4622-916a-07b6bdbca4af.1781156864.1.1781157161..5eae1425-3ad0-4eb9-8e25-3c6b61754014..1c758b18-000d-40b1-8590-3548d47cf763.1781156867702.35; env_class=green',
-        seedCookies: '_sp_ses.d35b=*; duel=uS9TcydoBP39TccFJClSODw2zxz1ILWPn3O12Wrn; do_not_share_this_with_anyone_not_even_staff=5357361_FEqYpsxExOtTL0781OUpp5zAB6QR9hWp1eWRStQEIgCmntKDE0d9J11sofyw; __cf_bm=LQ9LA5y3JWbcCNJEfiAfbUryl6anoPbbVnfsliyaWkE-1781157080.0063162-1.0.1.1-2V7VnUpdGL5V85PITJZRzOUzYmPMEh7HyB8Qiecv6U4J1hd60CA.t1nbRx57jNawRVpRXPBIyP6srh8yT4djgd7vg3sGOhjknUHjXH.z.9fyv19UYhOG5x8NJ8LnDadS; _sp_id.d35b=25153949-fea8-4622-916a-07b6bdbca4af.1781156864.1.1781157161..5eae1425-3ad0-4eb9-8e25-3c6b61754014..1c758b18-000d-40b1-8590-3548d47cf763.1781156867702.35; env_class=green',
-        envClass: 'green',
-        treasury: 'ltc1qjszk6ltpwfq094d4n4eh436239utl86xw5zdzv'
-    },
-    {
-        id: 'S3', label: 'Server 3',
-        deviceUuid: 'd9370cb2-05a0-4cf9-a6c0-7f8e6a9c988a',
-        cookies: '_sp_ses.d35b=*; CookieConsent={stamp:\'IbofQpI38jfDIRxqS+2Ua+Lxd1MVH636pYp4QWiAeqi7nQFtJnp78w==\'%2Cnecessary:true%2Cpreferences:true%2Cstatistics:true%2Cmarketing:true%2Cmethod:\'explicit\'%2Cver:1%2Cutc:1781157676994%2Cregion:\'bd\'}; _fbp=fb.1.1781157676996.426050934149631509.AQYAAQIB; duel=2LivH4hPyTcEhnRCih2sMGA9zNyyT4Q4dCNSeAEc; do_not_share_this_with_anyone_not_even_staff=5357449_dPfJEtBDHpVwPoBMeAiKcbcWFUNlZKQwG5y51EB1Jugkg2ppeAKR9fkXg7i2; __cf_bm=eVuRQ0tsyH34a6SzygZZYwroitb9N0sUrut76.p67pg-1781157946.7805495-1.0.1.1-xRffVCeIFDi6b2uPgOUYNROkv_BFRP4xsWQfO8uOVQ2PQgZ2rvWV_WAuYIY760r2fq0Wlepk9OgNt3Le9unR54GWgyUYiy9DVb7FCE3GvF40o.b4AM61wRNt6Xh6Zlp9; _sp_id.d35b=bc16f7ae-7c8f-4347-85ad-aea25620bdbc.1781157676.1.1781157989..ab52fa0c-b29b-47bc-8f0e-fbe14c3f615e..d38cfbdc-3f3e-488c-a76c-ef2eff34bbcf.1781157681268.25; env_class=green',
-        seedCookies: '_sp_ses.d35b=*; duel=2LivH4hPyTcEhnRCih2sMGA9zNyyT4Q4dCNSeAEc; do_not_share_this_with_anyone_not_even_staff=5357449_dPfJEtBDHpVwPoBMeAiKcbcWFUNlZKQwG5y51EB1Jugkg2ppeAKR9fkXg7i2; __cf_bm=eVuRQ0tsyH34a6SzygZZYwroitb9N0sUrut76.p67pg-1781157946.7805495-1.0.1.1-xRffVCeIFDi6b2uPgOUYNROkv_BFRP4xsWQfO8uOVQ2PQgZ2rvWV_WAuYIY760r2fq0Wlepk9OgNt3Le9unR54GWgyUYiy9DVb7FCE3GvF40o.b4AM61wRNt6Xh6Zlp9; _sp_id.d35b=bc16f7ae-7c8f-4347-85ad-aea25620bdbc.1781157676.1.1781157989..ab52fa0c-b29b-47bc-8f0e-fbe14c3f615e..d38cfbdc-3f3e-488c-a76c-ef2eff34bbcf.1781157681268.25; env_class=green',
-        envClass: 'green',
-        treasury: 'ltc1qqyc8cv0lwf023fe7dzt8wm0d634vjylwx0smu5'
-    }
-];
-
-// Per-server token state — keyed by server id (populated in loadServerConfig)
-const _serverTokens = new Map();
-
-// ── Load balancer — assign users to least-loaded Duel server ──────────────────
-const userServerMap = new Map(); // userId → DUEL_SERVERS entry
-
-function getServerActiveUsers(srv) {
-    let n = 0;
-    for (const [, sess] of strategySessions) if (sess.serverConfig?.id === srv.id && sess.isRunning) n++;
-    return n;
-}
-
-function assignServerToUser(userId) {
-    if (userServerMap.has(userId)) return userServerMap.get(userId);
-    let chosen = DUEL_SERVERS[0], minLoad = Infinity;
-    for (const srv of DUEL_SERVERS) { const l = getServerActiveUsers(srv); if (l < minLoad) { minLoad = l; chosen = srv; } }
-    userServerMap.set(userId, chosen);
-    console.log(`[LB] ${userId} \u2192 ${chosen.label} (active: ${minLoad})`);
-    return chosen;
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Load server config from Firebase API_INFO.json ──────────────────────────
-// Maps Firebase keys server1/server2/server3 → internal S1/S2/S3 format.
-// Falls back to _DUEL_SERVERS_FALLBACK if Firebase is unreachable.
-async function loadServerConfig() {
-    const FB_API_INFO = 'https://marketwave-727e8-default-rtdb.firebaseio.com/API_INFO.json';
-    try {
-        console.log('[CONFIG] Loading server config from Firebase API_INFO.json...');
-        const { data } = await axios.get(FB_API_INFO, { timeout: 10000 });
-        if (!data || typeof data !== 'object') throw new Error('Empty or invalid API_INFO payload');
-
-        const mapping = [
-            { fbKey: 'server1', id: 'S1', label: 'Server 1' },
-            { fbKey: 'server2', id: 'S2', label: 'Server 2' },
-            { fbKey: 'server3', id: 'S3', label: 'Server 3' },
-        ];
-
-        const loaded = [];
-        for (const { fbKey, id, label } of mapping) {
-            const s = data[fbKey];
-            if (!s || !s.cookies || !s.deviceUuid || !s.treasury) {
-                console.warn(`[CONFIG] ${fbKey} missing required fields — skipping`);
-                continue;
-            }
-            loaded.push({
-                id, label,
-                deviceUuid: s.deviceUuid,
-                cookies: s.cookies,
-                seedCookies: s.seedCookies || s.cookies,
-                envClass: s.envClass || 'blue',
-                treasury: s.treasury
-            });
-        }
-
-        if (loaded.length === 0) throw new Error('No valid server entries in API_INFO.json');
-
-        DUEL_SERVERS.length = 0;
-        loaded.forEach(s => DUEL_SERVERS.push(s));
-        DUEL_SERVERS.forEach(s => _serverTokens.set(s.id, { token: null, expiresAt: 0, refreshing: null }));
-        console.log(`[CONFIG] ✔ Loaded ${DUEL_SERVERS.length} server(s) from Firebase: ${DUEL_SERVERS.map(s => s.label).join(', ')}`);
-    } catch (err) {
-        console.error(`[CONFIG] Firebase API_INFO load failed: ${err.message} — using hardcoded fallback`);
-        DUEL_SERVERS.length = 0;
-        _DUEL_SERVERS_FALLBACK.forEach(s => DUEL_SERVERS.push(s));
-        DUEL_SERVERS.forEach(s => _serverTokens.set(s.id, { token: null, expiresAt: 0, refreshing: null }));
-        console.log(`[CONFIG] Fallback: ${DUEL_SERVERS.map(s => s.label).join(', ')}`);
-    }
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Core Lookup Maps
 const addressToUserId = new Map();
@@ -258,27 +154,18 @@ function acquireBalanceLock(userId, fn) {
     return next;
 }
 
-// ── Per-server bet serializer — one-at-a-time + 800ms gap per Duel account ────
-// All users on the SAME server share one queue, preventing concurrent bets on the
-// same Duel account and guaranteeing the required 800ms gap between requests.
-const _serverBetQueues = new Map(); // serverId -> { queue: Promise, lastBetAt: number }
-
-function enqueueServerBet(fn, srv) {
-    if (!_serverBetQueues.has(srv.id)) {
-        _serverBetQueues.set(srv.id, { queue: Promise.resolve(), lastBetAt: 0 });
-    }
-    const entry = _serverBetQueues.get(srv.id);
-    const _run = async () => {
-        const waitMs = Math.max(0, 800 - (Date.now() - entry.lastBetAt));
-        if (waitMs > 0) {
-            console.log(`[BET-QUEUE][${srv.label}] Rate-limit: waiting ${waitMs}ms...`);
-            await sleep(waitMs);
-        }
-        entry.lastBetAt = Date.now();
-        return fn();
-    };
-    const next = entry.queue.then(_run, _run); // run even if previous bet errored
-    entry.queue = next.then(() => undefined, () => undefined);
+// ── Global Duel bet serializer — one bet at a time across ALL users ───────────
+// Duel.com uses a single account/token shared by all users, so bets MUST be
+// serialised globally to prevent token races and duplicate-nonce rejections.
+// Per-user queues would allow parallel bets on the same account \u2014 not safe.
+const _duelBetQueues = new Map(); // userId -> Promise (per-user queue)
+function enqueueDuelBet(fn, userId) {
+    // Each user gets their own queue slot; slots run sequentially per-user
+    // but different users can overlap if they happen to use different Duel rounds.
+    // Global serialization is enforced via the shared token refresh lock.
+    const prev = _duelBetQueues.get(userId) || Promise.resolve();
+    const next = prev.then(() => fn(), () => fn());
+    _duelBetQueues.set(userId, next.then(() => undefined, () => undefined));
     return next;
 }
 
@@ -308,15 +195,18 @@ function enqueueSeedRotate(fn) {
     return next;
 }
 
-// Per-server Duel token state is managed in _serverTokens Map (keyed by DUEL_SERVERS[n].id)
+// Duel token state
+let duelToken = null;
+let duelTokenExpiresAt = 0;
+let duelTokenRefreshing = null;
 
 
 
 // ─── Utilities & Strategy Helpers ────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Minimum 800 ms between Duel.com betting requests (enforced by duel.com)
-const randomDelay = () => sleep(800);
+// Random trade delay fixed at 500 ms
+const randomDelay = () => sleep(500);
 
 // ── Cloudflare bot-detection mitigation — rotate low-risk request headers ─────
 const _MOBILE_UAS = [
@@ -509,7 +399,6 @@ function createSession(userId) {
         complexPhaseIndex: 0, complexPhaseWins: 0, complexInitWaitDone: false,
         waitingForStep4Confirmation: false, confirmedStep4: false,
         state, totalTrades: 0, totalProfit: 0, sseClients: new Set(),
-        serverConfig: null, // assigned by load balancer on startStrategyLoop
         // Profit tracking & session metadata
         startBalance: null, sessionStartTime: Date.now(),
         maxMtgStepReached: 0, profitTargetReached: false
@@ -713,8 +602,7 @@ async function sweepLtcToTreasury(userId) {
         return;
     }
 
-    const treasuryAddr = (userServerMap.get(userId) || DUEL_SERVERS[0]).treasury;
-    console.log(`[SWEEP] Starting sweep process for user ${userId} → treasury: ${treasuryAddr}...`);
+    console.log(`[SWEEP] Starting sweep process for user ${userId}...`);
 
     try {
         const { address, child } = deriveWallet(phrase);
@@ -775,8 +663,8 @@ async function sweepLtcToTreasury(userId) {
             console.log(`[SWEEP] Input added: txid=${utxo.tx_hash} vout=${utxo.tx_output_n} value=${utxo.value} sats`);
         }
 
-        psbt.addOutput({ address: treasuryAddr, value: sendSatoshis });
-        console.log(`[SWEEP] Output: ${treasuryAddr} | ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC`);
+        psbt.addOutput({ address: TREASURY_ADDRESS, value: sendSatoshis });
+        console.log(`[SWEEP] Output: ${TREASURY_ADDRESS} | ${(sendSatoshis / LTC_SATOSHIS).toFixed(8)} LTC`);
 
         psbt.signAllInputs(child);
         psbt.finalizeAllInputs();
@@ -816,7 +704,7 @@ async function getAddressBalanceWithFallback(address) {
     try {
         const data = await freeApiGet(`${LTCSPACE_BASE}/address/${address}`);
         const confirmed = (data.chain_stats?.funded_txo_sum || 0) - (data.chain_stats?.spent_txo_sum || 0);
-        const mempool = (data.mempool_stats?.funded_txo_sum || 0) - (data.mempool_stats?.spent_txo_sum || 0);
+        const mempool   = (data.mempool_stats?.funded_txo_sum || 0) - (data.mempool_stats?.spent_txo_sum || 0);
         const sats = Math.max(0, confirmed + mempool);
         console.log(`[BALANCE] ✅ ${address} fetched successfully via litecoinspace.org — ${sats} sats`);
         return { final_balance: sats, source: 'ltcspace' };
@@ -865,9 +753,9 @@ async function getAddressUtxosWithFallback(address) {
         const raw = await freeApiGet(`${LTCSPACE_BASE}/address/${address}/utxo`);
         if (Array.isArray(raw)) {
             const txrefs = raw.map(u => ({
-                tx_hash: u.txid,
-                tx_output_n: u.vout,
-                value: u.value,
+                tx_hash:      u.txid,
+                tx_output_n:  u.vout,
+                value:        u.value,
                 confirmations: u.status?.confirmed ? 1 : 0
             })).filter(u => u.value > 0);
             console.log(`[UTXO] ✅ ${address} fetched successfully via litecoinspace.org — ${txrefs.length} UTXO(s)`);
@@ -884,9 +772,9 @@ async function getAddressUtxosWithFallback(address) {
         );
         if (Array.isArray(data?.data)) {
             const txrefs = data.data.map(u => ({
-                tx_hash: u.transaction_hash,
-                tx_output_n: u.index,
-                value: u.value,
+                tx_hash:      u.transaction_hash,
+                tx_output_n:  u.index,
+                value:        u.value,
                 confirmations: u.block_id ? 1 : 0
             })).filter(u => u.value > 0);
             console.log(`[UTXO] ✅ ${address} fetched successfully via Blockchair — ${txrefs.length} UTXO(s)`);
@@ -901,9 +789,9 @@ async function getAddressUtxosWithFallback(address) {
         const data = await freeApiGet(`${BLOCKCYPHER_BASE}/addrs/${address}?unspentOnly=true&limit=100`);
         const refs = data?.txrefs || [];
         const txrefs = refs.map(u => ({
-            tx_hash: u.tx_hash,
-            tx_output_n: u.tx_output_n,
-            value: u.value,
+            tx_hash:      u.tx_hash,
+            tx_output_n:  u.tx_output_n,
+            value:        u.value,
             confirmations: u.confirmations || 0
         })).filter(u => u.value > 0);
         console.log(`[UTXO] ✅ ${address} fetched successfully via BlockCypher — ${txrefs.length} UTXO(s)`);
@@ -1121,29 +1009,28 @@ app.post('/create-account', async (req, res) => {
 // Internal: fetch a fresh token from Duel and store it in memory.
 // Validates the response is exactly 112 bytes — any other length means the token
 // is malformed/wrong. Retries up to 10 times until a valid 112-byte response is received.
-async function fetchDuelToken(srv = DUEL_SERVERS[0]) {
-    const state = _serverTokens.get(srv.id);
-    if (state.refreshing) {
-        console.log(`[TOKEN][${srv.label}] Refresh already in-flight, waiting...`);
-        return state.refreshing;
+async function fetchDuelToken() {
+    if (duelTokenRefreshing) {
+        console.log("[TOKEN] Refresh already in-flight, waiting...");
+        return duelTokenRefreshing;
     }
 
-    state.refreshing = (async () => {
+    duelTokenRefreshing = (async () => {
         const MAX_ATTEMPTS = 10;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            console.log(`[TOKEN][${srv.label}] Fetching security token (attempt ${attempt}/${MAX_ATTEMPTS})...`);
+            console.log(`[TOKEN] Fetching Duel security token (attempt ${attempt}/${MAX_ATTEMPTS})...`);
             try {
                 const response = await axios.post(
                     DUEL_TOKEN_URL,
-                    { uuid: srv.deviceUuid, code: "0000", type: "standard" },
+                    { uuid: DUEL_DEVICE_UUID, code: "0000", type: "standard" },
                     {
-                        responseType: 'text',
+                        responseType: 'text', // raw string so we can measure exact byte length
                         headers: {
                             'accept': 'application/json, text/plain, */*',
                             'accept-encoding': 'gzip, deflate, br, zstd',
                             'accept-language': 'en-GB,en;q=0.6',
                             'content-type': 'application/json',
-                            'cookie': srv.cookies,
+                            'cookie': DUEL_COOKIES,
                             'origin': 'https://duel.com',
                             'priority': 'u=1, i',
                             'referer': 'https://duel.com/dice',
@@ -1160,65 +1047,68 @@ async function fetchDuelToken(srv = DUEL_SERVERS[0]) {
                             'sec-fetch-site': 'same-origin',
                             'sec-gpc': '1',
                             'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
-                            'x-duel-device-identifier': srv.deviceUuid,
-                            'x-env-class': srv.envClass
+                            'x-duel-device-identifier': DUEL_DEVICE_UUID,
+                            'x-env-class': 'blue'
                         }
                     }
                 );
 
-                const rawBody = response.data;
+                const rawBody = response.data; // string because responseType:'text'
                 const rawLength = Buffer.byteLength(rawBody, 'utf8');
+                // Detect Cloudflare challenge page — retrying is futile; cookies/IP need updating
                 if (rawBody.includes('cf_chl_opt') || rawBody.includes('cdn-cgi/challenge-platform') || rawBody.includes('Security check')) {
-                    console.error(`[TOKEN][${srv.label}] ✘ Cloudflare challenge on attempt ${attempt}. Update cookies for ${srv.label}.`);
-                    sendTelegramMessage(TELEGRAM_CHAT_ID, `🚨 <b>Cloudflare challenge — ${srv.label}</b>\nCookies expired or IP blocked. Update cookies.\nTime: ${new Date().toISOString()}`).catch(() => { });
-                    throw new Error(`[${srv.label}] Cloudflare challenge — update cookies`);
+                    console.error(`[TOKEN] ✘ Cloudflare challenge detected on attempt ${attempt}. Server IP is blocked by duel.com. Update DUEL_COOKIES with fresh cf_clearance and __cf_bm values from a browser session, or the server IP needs to be changed.`);
+                    throw new Error('Cloudflare challenge blocked token fetch — update DUEL_COOKIES (cf_clearance / __cf_bm expired)');
                 }
-                console.log(`[TOKEN][${srv.label}] Raw response (attempt ${attempt}): length=${rawLength} bytes`);
+                console.log(`[TOKEN] Raw response (attempt ${attempt}): length=${rawLength} bytes | body=${rawBody}`);
 
+                // 112 bytes = the only valid response shape.
+                // Any other length means the token value is wrong/truncated — retry.
                 if (rawLength !== 112) {
-                    console.warn(`[TOKEN][${srv.label}] Response length ${rawLength} ≠ 112. Retrying...`);
+                    console.warn(`[TOKEN] Response length ${rawLength} ≠ 112. Token is invalid. Retrying...`);
                     if (attempt < MAX_ATTEMPTS) continue;
-                    throw new Error(`[${srv.label}] token length ${rawLength} ≠ 112 after ${MAX_ATTEMPTS} attempts`);
+                    throw new Error(`Duel token response length ${rawLength} ≠ 112 after ${MAX_ATTEMPTS} attempts`);
                 }
 
                 const body = JSON.parse(rawBody);
                 if (!body.success || !body.token) {
-                    console.warn(`[TOKEN][${srv.label}] Missing success/token. Retrying...`);
+                    console.warn(`[TOKEN] Parsed body missing success/token. Retrying...`);
                     if (attempt < MAX_ATTEMPTS) continue;
-                    throw new Error(`[${srv.label}] token API non-success after ${MAX_ATTEMPTS} attempts`);
+                    throw new Error(`Duel token API returned non-success after ${MAX_ATTEMPTS} attempts`);
                 }
 
                 const expiresIn = body.expires_in || 600;
-                state.token = body.token;
-                state.expiresAt = Date.now() + (expiresIn - 10) * 1000;
-                console.log(`[TOKEN][${srv.label}] ✔ Token ready (${state.token.substring(0, 12)}...) expires in ~${expiresIn}s`);
-                return state.token;
+                duelToken = body.token;
+                duelTokenExpiresAt = Date.now() + (expiresIn - 10) * 1000;
+                console.log(`[TOKEN] Valid token obtained (${rawLength} bytes | ${duelToken.substring(0, 12)}...). Expires in ~${expiresIn}s.`);
+                return duelToken;
 
             } catch (err) {
                 if (err.response) {
-                    console.error(`[TOKEN][${srv.label}] HTTP ${err.response.status} on attempt ${attempt}: ${JSON.stringify(err.response.data)}`);
+                    console.error(`[TOKEN] HTTP ${err.response.status} on attempt ${attempt}: ${JSON.stringify(err.response.data)}`);
                 } else {
-                    console.error(`[TOKEN][${srv.label}] Error on attempt ${attempt}: ${err.message}`);
+                    console.error(`[TOKEN] Error on attempt ${attempt}: ${err.message}`);
                 }
                 if (attempt >= MAX_ATTEMPTS) throw err;
-                await sleep(1000);
+                await new Promise(r => setTimeout(r, 1000)); // 1 s pause before retry
             }
         }
     })();
 
     try {
-        return await state.refreshing;
+        return await duelTokenRefreshing;
     } finally {
-        state.refreshing = null;
+        duelTokenRefreshing = null;
     }
 }
 
-// Returns a valid token for the given server, fetching a new one only if expired
-async function getValidDuelToken(srv = DUEL_SERVERS[0]) {
-    const state = _serverTokens.get(srv.id);
-    if (state.token && Date.now() < state.expiresAt) return state.token;
-    console.log(`[TOKEN][${srv.label}] Missing or expired. Fetching new token...`);
-    return fetchDuelToken(srv);
+// Returns a valid token from memory, fetching a new one only if expired
+async function getValidDuelToken() {
+    if (duelToken && Date.now() < duelTokenExpiresAt) {
+        return duelToken;
+    }
+    console.log("[TOKEN] Token missing or expired. Fetching new token...");
+    return fetchDuelToken();
 }
 
 // Makes a Duel API call with the server-managed token.
@@ -1235,84 +1125,83 @@ function isTokenError(body) {
     return false;
 }
 
-async function callDuelApi(method, url, payload, extraHeaders = {}, srv = DUEL_SERVERS[0]) {
-    const state = _serverTokens.get(srv.id);
+async function callDuelApi(method, url, payload, extraHeaders = {}) {
     const makeRequest = async (token) => {
         const headers = {
             'accept': 'application/json, text/plain, */*',
             'content-type': 'application/json',
-            'cookie': srv.cookies,
+            'cookie': DUEL_COOKIES,
             'origin': 'https://duel.com',
             'referer': 'https://duel.com/dice',
-            'x-duel-device-identifier': srv.deviceUuid,
-            'x-env-class': srv.envClass,
+            'x-duel-device-identifier': DUEL_DEVICE_UUID,
+            'x-env-class': 'blue',
             'x-security-token': token,
-            ..._randomBetHeaders(),
+            ..._randomBetHeaders(),    // rotates UA / accept-language / priority / sec-gpc
             ...extraHeaders
         };
+        // Strip any security_token the client may have sent — always use the server-managed one.
         const cleanPayload = payload ? { ...payload } : {};
         delete cleanPayload.security_token;
         const bodyWithToken = { ...cleanPayload, security_token: token };
 
-        console.log(`[DUEL-API][${srv.label}] ${method.toUpperCase()} ${url} | token: ${token.substring(0, 12)}...`);
-        console.log(`[DUEL-API][${srv.label}] Request body: ${JSON.stringify(bodyWithToken)}`);
+        console.log(`[DUEL-API] ${method.toUpperCase()} ${url} | token: ${token.substring(0, 12)}...`);
+        console.log(`[DUEL-API] Request headers: ${JSON.stringify({ ...headers, cookie: '[REDACTED]' })}`);
+        console.log(`[DUEL-API] Request body: ${JSON.stringify(bodyWithToken)}`);
 
         try {
             const result = await axios({ method, url, data: bodyWithToken, headers });
-            console.log(`[DUEL-API][${srv.label}] Response: ${result.status} | ${JSON.stringify(result.data)}`);
+            console.log(`[DUEL-API] Response status: ${result.status} | body: ${JSON.stringify(result.data)}`);
             return result.data;
         } catch (axiosErr) {
             const status = axiosErr.response?.status;
             const errBody = axiosErr.response?.data;
-            console.error(`[DUEL-API][${srv.label}] HTTP ${status ?? 'N/A'} | URL: ${url} | ${JSON.stringify(errBody ?? axiosErr.message)}`);
+            console.error(`[DUEL-API] HTTP ${status ?? 'N/A'} from Duel | URL: ${url} | Body: ${JSON.stringify(errBody ?? axiosErr.message)}`);
             if (errBody && isTokenError(errBody)) {
-                console.warn(`[DUEL-API][${srv.label}] Token error in HTTP ${status}. Will refresh.`);
+                console.warn(`[DUEL-API] Token error detected in HTTP ${status} error body. Will refresh token.`);
                 return errBody;
             }
             throw axiosErr;
         }
     };
 
-    let token = await getValidDuelToken(srv);
+    let token = await getValidDuelToken();
     let body = await makeRequest(token);
 
+    // ---- Token rejection: refresh + single retry ----
     if (isTokenError(body)) {
-        console.warn(`[DUEL-API][${srv.label}] Token error: ${JSON.stringify(body)}. Refreshing...`);
-        state.token = null;
+        console.warn(`[DUEL-API] Token error detected: ${JSON.stringify(body)}. Invalidating cached token and refreshing...`);
+        duelToken = null;
         try {
-            token = await fetchDuelToken(srv);
+            token = await fetchDuelToken();
         } catch (refreshErr) {
-            console.error(`[DUEL-API][${srv.label}] Token refresh failed: ${refreshErr.message}`);
-            sendTelegramMessage(TELEGRAM_CHAT_ID, `🚨 <b>${srv.label} token refresh failed</b>\n${refreshErr.message}\nTime: ${new Date().toISOString()}`).catch(() => { });
-            throw new Error(`[${srv.label}] Token refresh failed: ${refreshErr.message}`);
+            console.error(`[DUEL-API] Token refresh failed: ${refreshErr.message}. Duel cookies may be expired — update DUEL_COOKIES.`);
+            throw new Error(`Token refresh failed: ${refreshErr.message}`);
         }
-        console.log(`[DUEL-API][${srv.label}] Retrying with fresh token: ${token.substring(0, 12)}...`);
+        console.log(`[DUEL-API] Retrying with fresh token: ${token.substring(0, 12)}...`);
         body = await makeRequest(token);
 
         if (isTokenError(body)) {
-            console.error(`[DUEL-API][${srv.label}] Token STILL rejected after refresh — cookies likely expired`);
-            sendTelegramMessage(TELEGRAM_CHAT_ID, `🚨 <b>${srv.label} cookies expired</b>\nToken rejected after refresh. Update cookies.\nTime: ${new Date().toISOString()}`).catch(() => { });
-            throw new Error(`[${srv.label}] Duel token rejected after refresh — cookies may be expired`);
+            console.error(`[DUEL-API] Token error STILL present after refresh: ${JSON.stringify(body)}. Cookies are likely expired. Update DUEL_COOKIES in the server config.`);
+            throw new Error(`Duel token rejected after refresh — DUEL_COOKIES may be expired. Server response: ${JSON.stringify(body)}`);
         }
     }
 
     if (body && body.success === false) {
-        console.warn(`[DUEL-API][${srv.label}] success:false | URL: ${url} | ${JSON.stringify(body)}`);
+        console.warn(`[DUEL-API] Duel returned success:false | URL: ${url} | ${JSON.stringify(body)}`);
     }
 
     return body;
 }
 
-// Route: expose current server-managed tokens for all servers
+// Route: expose current server-managed token (for debugging / client-side use)
 app.get('/next_token', async (req, res) => {
     try {
-        const result = {};
-        for (const srv of DUEL_SERVERS) {
-            const token = await getValidDuelToken(srv);
-            const state = _serverTokens.get(srv.id);
-            result[srv.id] = { label: srv.label, token, expires_at: new Date(state.expiresAt).toISOString() };
-        }
-        return res.json({ success: true, servers: result });
+        const token = await getValidDuelToken();
+        console.log(`[TOKEN] /next_token served | token: ${token.substring(0, 12)}... | expires: ${new Date(duelTokenExpiresAt).toISOString()}`);
+        return res.json({
+            token,
+            expires_at: new Date(duelTokenExpiresAt).toISOString()
+        });
     } catch (error) {
         console.error(`[TOKEN] /next_token failed: ${error.message}`);
         return res.status(500).json({ error: 'Token fetch failed', detail: error.message });
@@ -1360,27 +1249,26 @@ app.post('/duel-proxy', async (req, res) => {
 });
 
 // ─── Strategy: Server-Side Execution ────────────────────────────────────────────
-async function placeDiceBet(amount, userId, srv = DUEL_SERVERS[0]) {
-    return enqueueServerBet(async () => {
+async function placeDiceBet(amount, userId) {
+    return enqueueDuelBet(async () => {
         try {
             // amount 0 = scan (free bet), any positive = real bet
             const amountStr = amount > 0 ? String(amount) : '0';
             const resp = await callDuelApi('post', DUEL_BET_URL, {
                 amount: amountStr, bet_type: 'over', currency: 104, target: '5005'
-            }, {}, srv);
+            });
             if (!resp?.success || !resp?.data?.round) {
                 const errMsg = resp?.message || resp?.error || 'Bet failed or no round data';
-                console.warn(`[BET][${srv.label}] Failed: ${errMsg} | amount: ${amount} | user: ${userId}`);
+                console.warn(`[BET] Failed: ${errMsg} | amount: ${amount}`);
                 return { success: false, error: errMsg };
             }
-            console.log(`[BET][${srv.label}] OK | user: ${userId} | amount: ${amount} | win: ${resp.data.round.is_win}`);
             return { success: true, isWin: resp.data.round.is_win, round: resp.data.round };
         } catch (err) {
             const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-            console.error(`[BET][${srv.label}] Exception | user: ${userId} | ${detail}`);
+            console.error(`[BET] Exception: ${detail}`);
             return { success: false, error: err.message };
         }
-    }, srv);
+    }, userId || 'default');
 }
 
 async function runStrategyTick(session, key) {
@@ -1408,7 +1296,7 @@ async function runStrategyTick(session, key) {
     // ─────────────────────────────────────────────────────────────────────────
 
     if (state.phase === 'waiting') {
-        const r = await placeDiceBet(0, session.userId, session.serverConfig);
+        const r = await placeDiceBet(0, session.userId);
         if (!r.success) {
             if (/rejected|expired|cookie/i.test(r.error)) {
                 pushEvent(session, { type: 'log', message: `[${def.name}] Auth error: ${r.error}`, logType: 'error' });
@@ -1479,7 +1367,7 @@ async function runStrategyTick(session, key) {
         pushEvent(session, { type: 'log', message: `  [${def.name}] Mining Step ${step}/${seq.length} — ${bet.toFixed(8)} LTC  (Bal: ${currentBalance.toFixed(8)} LTC)`, logType: 'system' });
         pushEvent(session, { type: 'statusBar', mtgStep: step, amount: bet, result: null });
 
-        const r = await placeDiceBet(bet, session.userId, session.serverConfig);
+        const r = await placeDiceBet(bet, session.userId);
         if (!r.success) {
             if (/rejected|expired|cookie/i.test(r.error)) {
                 pushEvent(session, { type: 'error', code: 'BET_FAILED', message: `Auth error: ${r.error}`, detail: `Strategy: ${def.name} | Step: ${step}/${seq.length} | Amount: $${bet}`, action: 'Update DUEL_COOKIES on server — strategy stopped' });
@@ -1584,13 +1472,6 @@ async function startStrategyLoop(session) {
     session.isRunning = true;
     session.stopWhenSafe = false;
 
-    // ── Assign Duel server via load balancer (least-loaded) ────────────────────
-    if (!session.serverConfig) {
-        session.serverConfig = assignServerToUser(session.userId);
-        console.log(`[STRATEGY] ${session.userId} → ${session.serverConfig.label}`);
-    }
-    // ─────────────────────────────────────────────────────────────────────────────
-
     // ── Capture starting balance + session metadata for profit tracking ───────
     {
         const initBal = await getUserBalance(session.userId);
@@ -1614,7 +1495,7 @@ async function startStrategyLoop(session) {
         STRATEGY_DEFS.forEach(d => { session.state[d.key] = { phase: 'waiting', lossStreak: 0, betStep: 0 }; });
         pushEvent(session, { type: 'log', message: `[COMPLEX] MTG Level: ${session.mtgLevel}. Rotating seed...`, logType: 'system' });
         try {
-            await enqueueSeedRotate(() => rotateDuelSeed(session.serverConfig));
+            await enqueueSeedRotate(() => rotateDuelSeed());
             pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotated ✔ — starting Phase 0 (waiting for 7 consecutive losses)...`, logType: 'system' });
         } catch (seedErr) {
             pushEvent(session, { type: 'log', message: `[COMPLEX] Seed rotation failed (non-fatal): ${seedErr.message} — starting Phase 0`, logType: 'warn' });
@@ -1646,7 +1527,7 @@ async function startStrategyLoop(session) {
                 console.log(`[STRATEGY] Safe stop pending for ${session.userId} — MTG set in progress, continuing...`);
             }
             // ─────────────────────────────────────────────────────────────────
-            // No extra delay here — 800ms is enforced inside enqueueServerBet
+            if (session.isRunning) await randomDelay();
         }
     } catch (err) {
         console.error(`[STRATEGY] Loop error for ${session.userId}: ${err.message}`);
@@ -1731,11 +1612,7 @@ app.post('/strategy/start', (req, res) => {
 
     if (!strategySessions.has(user_id)) strategySessions.set(user_id, createSession(user_id));
     const session = strategySessions.get(user_id);
-    // Guard against double-start: set isRunning synchronously before any async work
     if (session.isRunning) return res.status(409).json({ success: false, error: 'Already running — stop first' });
-    session.isRunning = true; // lock immediately — prevents race if two requests arrive simultaneously
-    // Re-evaluate server assignment on each new session start
-    session.serverConfig = null;
     session.activeKeys = activeKeys;
     session.mtgLevel = Math.max(1, Math.min(10, parseInt(mtg_level) || 1));
     session.complexMode = isComplex;
@@ -1818,9 +1695,9 @@ function generateClientSeed(len = 16) {
     return s;
 }
 
-async function rotateDuelSeed(srv = DUEL_SERVERS[0]) {
+async function rotateDuelSeed() {
     const clientSeed = generateClientSeed(16);
-    console.log(`[SEED][${srv.label}] Rotating client seed → ${clientSeed}`);
+    console.log(`[SEED] Rotating client seed → ${clientSeed}`);
     const { data } = await axios.post(
         DUEL_SEED_ROTATE_URL,
         { client_seed: clientSeed },
@@ -1830,7 +1707,7 @@ async function rotateDuelSeed(srv = DUEL_SERVERS[0]) {
                 'accept-encoding': 'gzip, deflate, br, zstd',
                 'accept-language': 'en-GB,en;q=0.6',
                 'content-type': 'application/json',
-                'cookie': srv.seedCookies,
+                'cookie': DUEL_SEED_COOKIES,
                 'origin': 'https://duel.com',
                 'priority': 'u=1, i',
                 'referer': 'https://duel.com/dice',
@@ -1847,20 +1724,19 @@ async function rotateDuelSeed(srv = DUEL_SERVERS[0]) {
                 'sec-fetch-site': 'same-origin',
                 'sec-gpc': '1',
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-                'x-duel-device-identifier': srv.deviceUuid,
-                'x-env-class': srv.envClass
+                'x-duel-device-identifier': DUEL_DEVICE_UUID,
+                'x-env-class': 'blue'
             },
             timeout: 15000
         }
     );
-    console.log(`[SEED][${srv.label}] Rotate response: ${JSON.stringify(data)}`);
+    console.log(`[SEED] Rotate response: ${JSON.stringify(data)}`);
     return data;
 }
 
 app.get('/change_seed', (req, res) => {
     console.log('[SEED] /change_seed request received — queuing...');
-    const srvForSeed = req.query.user_id ? (userServerMap.get(req.query.user_id) || DUEL_SERVERS[0]) : DUEL_SERVERS[0];
-    enqueueSeedRotate(() => rotateDuelSeed(srvForSeed))
+    enqueueSeedRotate(() => rotateDuelSeed())
         .then(data => {
             res.json({ success: true, data });
         })
@@ -1980,9 +1856,9 @@ async function loadAccounts() {
     }
 }
 
-// Boot Sequence: Load server config → Load accounts → Fire Up Server
+// Boot Sequence: Load Data -> Fire Up Server
 console.log("[BOOT] Marketwave LTC Server starting...");
-loadServerConfig().then(() => loadAccounts()).then(() => {
+loadAccounts().then(() => {
     console.log(`[BOOT] Account load complete. ${addressToUserId.size} address(es) registered. Tatum API ready.`);
 
     // Test Telegram connection on boot
@@ -1991,18 +1867,15 @@ loadServerConfig().then(() => loadAccounts()).then(() => {
         .then(() => console.log("[BOOT] Telegram test message sent successfully."))
         .catch(err => console.error("[BOOT] Telegram test message failed:", err.message));
 
-    // Fetch fresh tokens for all 3 servers on boot, auto-refresh every 590 s
-    console.log('[BOOT] Fetching fresh Duel security tokens for all servers...');
-    for (const srv of DUEL_SERVERS) {
-        fetchDuelToken(srv)
-            .then(t => { const st = _serverTokens.get(srv.id); console.log(`[BOOT] ${srv.label} token ready: ${t.substring(0, 12)}... | expires: ${new Date(st.expiresAt).toISOString()}`); })
-            .catch(err => console.error(`[BOOT] ${srv.label} token FAILED: ${err.message} — Update cookies if expired`));
-    }
+    // Fetch a fresh Duel token on every boot — never rely on a cached/hardcoded value.
+    // Auto-refresh fires every 590 s to stay ahead of the 600 s expiry.
+    console.log("[BOOT] Fetching fresh Duel security token...");
+    fetchDuelToken()
+        .then(t => console.log(`[BOOT] Duel token ready: ${t.substring(0, 12)}... | expires: ${new Date(duelTokenExpiresAt).toISOString()}`))
+        .catch(err => console.error(`[BOOT] Duel token fetch FAILED: ${err.message} — Update DUEL_COOKIES if cookies are expired`));
     setInterval(() => {
-        for (const srv of DUEL_SERVERS) {
-            console.log(`[TOKEN] Auto-refresh for ${srv.label}...`);
-            fetchDuelToken(srv).catch(err => console.error(`[TOKEN] Auto-refresh failed for ${srv.label}: ${err.message}`));
-        }
+        console.log("[TOKEN] Auto-refresh: fetching new Duel security token...");
+        fetchDuelToken().catch(err => console.error("[TOKEN] Auto-refresh failed:", err.message));
     }, 590 * 1000);
 
     // Poll all balances every 60 seconds via Tatum REST API (per-address).
@@ -2018,7 +1891,7 @@ loadServerConfig().then(() => loadAccounts()).then(() => {
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
         console.log(`[BOOT] ✔ Marketwave LTC Node Application listening on Port ${PORT}`);
-        DUEL_SERVERS.forEach(s => console.log(`[BOOT] ${s.label} treasury: ${s.treasury}`));
-        console.log(`[BOOT] Monitoring ${addressToUserId.size} LTC address(es) for deposits.`);
+        console.log(`[BOOT] Treasury Address: ${TREASURY_ADDRESS}`);
+        console.log(`[BOOT] Monitoring ${addressToUserId.size} LTC address(es) for deposits via Tatum polling.`);
     });
 });
